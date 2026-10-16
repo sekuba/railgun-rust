@@ -412,6 +412,8 @@ struct FetchedIndexedArtifactChunk {
     index: usize,
     in_flight_byte_charge: u64,
     chunk: VerifiedIndexedArtifactChunk,
+    /// The batch preference this chunk was dispatched under.
+    batch_preferred_gateway_index: Option<usize>,
     preferred_gateway_index: usize,
     gateway_index: usize,
     gateway_count: usize,
@@ -892,14 +894,28 @@ impl IndexedArtifactManifestClient {
         &self,
         descriptors: &[IndexedArtifactDescriptor],
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError> {
-        self.fetch_chunks_bounded_with_verified_progress(descriptors, |_, _, _| {})
+        self.fetch_chunks_bounded_with_preferred_gateway(descriptors, None)
             .await
-            .map(|batch| batch.chunks)
+    }
+
+    pub(crate) async fn fetch_chunks_bounded_with_preferred_gateway(
+        &self,
+        descriptors: &[IndexedArtifactDescriptor],
+        preferred_gateway_index: Option<usize>,
+    ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError> {
+        self.fetch_chunks_bounded_with_verified_progress(
+            descriptors,
+            preferred_gateway_index,
+            |_, _, _| {},
+        )
+        .await
+        .map(|batch| batch.chunks)
     }
 
     pub async fn fetch_chunks_bounded_with_progress<F>(
         &self,
         descriptors: &[IndexedArtifactDescriptor],
+        preferred_gateway_index: Option<usize>,
         mut on_chunk_verified: F,
     ) -> Result<Vec<VerifiedIndexedArtifactChunk>, IndexedArtifactManifestError>
     where
@@ -907,6 +923,7 @@ impl IndexedArtifactManifestClient {
     {
         self.fetch_chunks_bounded_with_verified_progress(
             descriptors,
+            preferred_gateway_index,
             |_, completed_chunks, total_chunks| {
                 on_chunk_verified(completed_chunks, total_chunks);
             },
@@ -918,6 +935,7 @@ impl IndexedArtifactManifestClient {
     pub(crate) async fn fetch_chunks_bounded_with_verified_progress<F>(
         &self,
         descriptors: &[IndexedArtifactDescriptor],
+        preferred_gateway_index: Option<usize>,
         mut on_chunk_verified: F,
     ) -> Result<IndexedArtifactChunkFetchBatch, IndexedArtifactManifestError>
     where
@@ -948,6 +966,7 @@ impl IndexedArtifactManifestClient {
         let mut byte_budget_waits = 0_u64;
         let mut slowest_chunk_elapsed_ms = 0_u128;
         let mut in_flight = FuturesUnordered::new();
+        let mut batch_preferred_gateway_index = preferred_gateway_index;
 
         while next_index < descriptors.len() || !in_flight.is_empty() {
             while next_index < descriptors.len() && in_flight.len() < concurrency {
@@ -980,7 +999,11 @@ impl IndexedArtifactManifestClient {
                 let index = next_index;
                 let byte_size = descriptor.byte_size;
                 let cid = descriptor.cid.clone();
-                let preferred_gateway_index = preferred_artifact_gateway_index(&descriptor);
+                // Without a batch preference, e.g. the gateway that served the manifest,
+                // chunks spread across gateways by content hash.
+                let dispatch_batch_preferred_gateway_index = batch_preferred_gateway_index;
+                let preferred_gateway_index = dispatch_batch_preferred_gateway_index
+                    .unwrap_or_else(|| preferred_artifact_gateway_index(&descriptor));
                 let dataset_kind = descriptor.dataset_kind;
                 let range_start = descriptor.range.start;
                 let range_end = descriptor.range.end;
@@ -1048,6 +1071,7 @@ impl IndexedArtifactManifestClient {
                         index,
                         in_flight_byte_charge,
                         chunk,
+                        batch_preferred_gateway_index: dispatch_batch_preferred_gateway_index,
                         preferred_gateway_index,
                         gateway_index,
                         gateway_count,
@@ -1100,6 +1124,22 @@ impl IndexedArtifactManifestClient {
                     elapsed_ms = fetched.elapsed_ms,
                     "indexed artifact chunk fetch verified"
                 );
+            }
+            // Later chunks follow the gateway that won a chunk dispatched under this preference.
+            if let Some(previous_gateway_index) = batch_preferred_gateway_index
+                && fetched.batch_preferred_gateway_index == batch_preferred_gateway_index
+                && fetched.gateway_index != previous_gateway_index % fetched.gateway_count
+            {
+                debug!(
+                    dataset_kind = ?fetched.chunk.descriptor.dataset_kind,
+                    range_start = fetched.chunk.descriptor.range.start,
+                    range_end = fetched.chunk.descriptor.range.end,
+                    previous_gateway_index,
+                    gateway_index = fetched.gateway_index,
+                    gateway_count = fetched.gateway_count,
+                    "indexed artifact chunk batch moved preferred gateway"
+                );
+                batch_preferred_gateway_index = Some(fetched.gateway_index);
             }
             results.push((fetched.index, fetched.chunk));
         }
@@ -1189,12 +1229,17 @@ impl IndexedArtifactManifestClient {
     ) -> Result<IndexedArtifactManifestFetchResult, IndexedArtifactManifestError> {
         let started = Instant::now();
         let fetcher = self.fetcher();
-        let candidates = fetcher.resolve_ipns_manifest_candidates(name).await?;
+        let candidates = fetcher
+            .resolve_ipns_manifest_candidates(name, last_accepted_sequence)
+            .await?;
         let candidate_count = candidates.len();
         let mut last_error = None;
         for (candidate_index, candidate) in candidates.into_iter().enumerate() {
             match fetcher
-                .fetch_manifest_cid_with_metadata(&candidate.cid.to_string())
+                .fetch_manifest_cid_with_metadata_from_gateway(
+                    &candidate.cid.to_string(),
+                    Some(candidate.gateway_index()),
+                )
                 .await
             {
                 Ok(fetched) => match self.verify_manifest_bytes(
@@ -3062,7 +3107,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bounded_chunk_fetch_skips_hedge_without_byte_budget_room() {
         let (task, stalled, serving, byte_size) =
-            spawn_chunk_fetch_with_stalled_preferred_gateway(1);
+            spawn_chunk_fetch_with_stalled_preferred_gateway(1, 1, ChunkBatchPreference::ChunkHash);
 
         yield_until("the stalled gateway receives the chunk request", || {
             stalled.request_count() == 1
@@ -3096,7 +3141,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn bounded_chunk_fetch_charges_hedge_to_byte_budget() {
         let (task, stalled, serving, byte_size) =
-            spawn_chunk_fetch_with_stalled_preferred_gateway(2);
+            spawn_chunk_fetch_with_stalled_preferred_gateway(1, 2, ChunkBatchPreference::ChunkHash);
 
         yield_until("the stalled gateway receives the chunk request", || {
             stalled.request_count() == 1
@@ -3115,6 +3160,66 @@ mod tests {
             batch.metrics.max_observed_in_flight_bytes,
             byte_size * 2,
             "the hedge is charged to the byte budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_chunk_fetch_starts_at_batch_preferred_gateway() {
+        // Budget room for a hedge bounds the run if the first request stalls.
+        let (task, stalled, serving, _) = spawn_chunk_fetch_with_stalled_preferred_gateway(
+            1,
+            2,
+            ChunkBatchPreference::ServingGateway,
+        );
+
+        let batch = task
+            .await
+            .expect("join fetch task")
+            .expect("manifest gateway serves the chunk");
+
+        assert_eq!(batch.chunks.len(), 1);
+        assert_eq!(serving.request_count(), 1);
+        assert_eq!(
+            stalled.request_count(),
+            0,
+            "the stalled hash-preferred gateway receives no chunk request"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_chunk_fetch_leaves_stalled_batch_preferred_gateway_after_hedge() {
+        // Both chunks also hash-prefer the stalled gateway, so neither keeping the batch
+        // preference nor falling back to the hash sends the second chunk elsewhere.
+        let started = tokio::time::Instant::now();
+        let (task, stalled, serving, _) = spawn_chunk_fetch_with_stalled_preferred_gateway(
+            2,
+            2,
+            ChunkBatchPreference::StalledGateway,
+        );
+
+        yield_until(
+            "the stalled gateway receives the first chunk request",
+            || stalled.request_count() == 1,
+        )
+        .await;
+        tokio::time::advance(CHUNK_HEDGE_DELAY).await;
+        yield_until("the chunk fetch finishes", || task.is_finished()).await;
+        let batch = task
+            .await
+            .expect("join fetch task")
+            .expect("serving gateway serves both chunks");
+
+        assert_eq!(batch.chunks.len(), 2);
+        assert_eq!(
+            stalled.request_count(),
+            1,
+            "the second chunk skips the stalled gateway"
+        );
+        assert_eq!(serving.request_count(), 2);
+        assert_eq!(
+            started.elapsed(),
+            CHUNK_HEDGE_DELAY,
+            "only the first chunk waits for a hedge"
         );
     }
 
@@ -3825,11 +3930,26 @@ mod tests {
         (config, gateway)
     }
 
-    /// Spawns a one-chunk fetch whose preferred gateway never answers and whose
-    /// other gateway serves the chunk. The byte budget holds `budget_charges`
-    /// charges of the chunk's size.
+    /// The batch preference passed to a chunk fetch with a stalled gateway.
+    #[derive(Clone, Copy)]
+    enum ChunkBatchPreference {
+        /// No batch preference: each chunk starts at its hash-preferred gateway.
+        ChunkHash,
+        /// The serving gateway, as when that gateway served the manifest.
+        ServingGateway,
+        /// The stalled gateway, as when it served the manifest but stalls on chunks.
+        StalledGateway,
+    }
+
+    /// Spawns a fetch of `chunk_count` equal-sized chunks that all hash-prefer a
+    /// gateway that never answers; the other gateway serves every chunk. The
+    /// stalled gateway holds its first request, or every request when the batch
+    /// prefers it. The byte budget holds `budget_charges` charges of one chunk's
+    /// size, and chunk concurrency is one.
     fn spawn_chunk_fetch_with_stalled_preferred_gateway(
+        chunk_count: usize,
         budget_charges: u64,
+        preference: ChunkBatchPreference,
     ) -> (
         tokio::task::JoinHandle<
             Result<IndexedArtifactChunkFetchBatch, IndexedArtifactManifestError>,
@@ -3838,21 +3958,39 @@ mod tests {
         ManifestGateway,
         u64,
     ) {
-        let bytes = b"hedged indexed artifact chunk".to_vec();
-        let descriptor = descriptors_for_bytes(&scope(), std::slice::from_ref(&bytes)).remove(0);
-        let cid = raw_cid(&bytes);
-        let routes = HashMap::from([(
-            format!("/ipfs/{cid}?format=car&dag-scope=entity"),
-            car_bytes(cid, &[(cid, bytes)]),
-        )]);
-        let stalled = ManifestGateway::spawn(routes.clone(), 1);
+        let hash_gateway_index = |bytes: &Vec<u8>| {
+            let descriptor = descriptors_for_bytes(&scope(), std::slice::from_ref(bytes)).remove(0);
+            preferred_artifact_gateway_index(&descriptor) % 2
+        };
+        let mut payloads =
+            (0_usize..).map(|n| format!("hedged indexed artifact chunk {n:04}").into_bytes());
+        let first = payloads.next().expect("first chunk payload");
+        let stalled_index = hash_gateway_index(&first);
+        let chunks = std::iter::once(first)
+            .chain(payloads.filter(|bytes| hash_gateway_index(bytes) == stalled_index))
+            .take(chunk_count)
+            .collect::<Vec<_>>();
+        let descriptors = descriptors_for_bytes(&scope(), &chunks);
+        let routes = chunks
+            .into_iter()
+            .map(|bytes| {
+                let cid = raw_cid(&bytes);
+                (
+                    format!("/ipfs/{cid}?format=car&dag-scope=entity"),
+                    car_bytes(cid, &[(cid, bytes)]),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let (stalled_requests, preferred_gateway_index) = match preference {
+            ChunkBatchPreference::ChunkHash => (1, None),
+            ChunkBatchPreference::ServingGateway => (1, Some(1 - stalled_index)),
+            ChunkBatchPreference::StalledGateway => (usize::MAX, Some(stalled_index)),
+        };
+        let stalled = ManifestGateway::spawn(routes.clone(), stalled_requests);
         let serving = ManifestGateway::spawn(routes, 0);
         let mut gateway_urls = vec![serving.url.clone()];
-        gateway_urls.insert(
-            preferred_artifact_gateway_index(&descriptor) % 2,
-            stalled.url.clone(),
-        );
-        let byte_size = descriptor.byte_size;
+        gateway_urls.insert(stalled_index, stalled.url.clone());
+        let byte_size = descriptors[0].byte_size;
         let mut config = config([7_u8; 32], None);
         config.gateway_urls = gateway_urls;
         config.concurrency = 1;
@@ -3860,7 +3998,11 @@ mod tests {
         let client = IndexedArtifactManifestClient::new(config, reqwest::Client::new());
         let task = tokio::spawn(async move {
             client
-                .fetch_chunks_bounded_with_verified_progress(&[descriptor], |_, _, _| {})
+                .fetch_chunks_bounded_with_verified_progress(
+                    &descriptors,
+                    preferred_gateway_index,
+                    |_, _, _| {},
+                )
                 .await
         });
         (task, stalled, serving, byte_size)

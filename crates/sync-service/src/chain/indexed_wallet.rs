@@ -471,6 +471,7 @@ impl IndexedWalletArtifactSession {
             &indexed_chunk_descriptors,
             &required_current_chunks,
             manifest.sequence,
+            preferred_gateway_index,
             public_data_plane,
             read_scope,
             progress_tx,
@@ -698,6 +699,7 @@ impl IndexedWalletArtifactSession {
         chunk_descriptors: &[(usize, IndexedArtifactDescriptor)],
         required_entries: &[IndexedArtifactPlannedChunk],
         manifest_sequence: u64,
+        preferred_gateway_index: Option<usize>,
         public_data_plane: &ChainPublicDataPlane,
         read_scope: PublicScanReadScope,
         progress_tx: Option<&SyncProgressSender>,
@@ -759,6 +761,7 @@ impl IndexedWalletArtifactSession {
             let fetched_batch = client
                 .fetch_chunks_bounded_with_verified_progress(
                     &missing_descriptors,
+                    preferred_gateway_index,
                     |chunk, completed_chunks, _| {
                         if stable_chunk_cids.contains(&chunk.descriptor.cid) {
                             Self::schedule_verified_chunk_maintenance(

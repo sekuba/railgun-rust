@@ -8875,9 +8875,22 @@ fn handle_path_request(
         .lock()
         .expect("path server paths lock")
         .push(path.clone());
+    let (status, reason, body) = routes
+        .get(&path)
+        .map_or((404_u16, "NOT FOUND", Vec::new()), |body| {
+            (200_u16, "OK", body.clone())
+        });
+    let headers = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).expect("write headers");
+    // A blocked path holds its body, not its headers, so the attempt outlives
+    // the gateway response-header time limit.
     if let Some(block) = block.as_ref()
         && block.path == path
     {
+        stream.flush().expect("flush blocked path headers");
         block
             .request_started
             .send(())
@@ -8889,16 +8902,6 @@ fn handle_path_request(
             .recv()
             .expect("release blocked path request");
     }
-    let (status, reason, body) = routes
-        .get(&path)
-        .map_or((404_u16, "NOT FOUND", Vec::new()), |body| {
-            (200_u16, "OK", body.clone())
-        });
-    let headers = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(headers.as_bytes()).expect("write headers");
     stream.write_all(&body).expect("write body");
 }
 

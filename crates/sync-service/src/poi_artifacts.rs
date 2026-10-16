@@ -205,6 +205,10 @@ pub enum CorpusCommitOutcome {
 pub struct ObservedManifest {
     manifest: Manifest,
     publication_id: PublicationId,
+    /// Configured index of the gateway that served the manifest bytes, used as
+    /// the first choice for its checkpoint catalogs. Transport metadata only;
+    /// it is not persisted.
+    serving_gateway_index: Option<usize>,
 }
 
 impl ObservedManifest {
@@ -216,6 +220,14 @@ impl ObservedManifest {
     #[must_use]
     pub const fn publication_id(&self) -> PublicationId {
         self.publication_id
+    }
+
+    pub(crate) const fn serving_gateway_index(&self) -> Option<usize> {
+        self.serving_gateway_index
+    }
+
+    pub(crate) const fn set_serving_gateway_index(&mut self, gateway_index: usize) {
+        self.serving_gateway_index = Some(gateway_index);
     }
 
     fn entry(&self, scope: &Scope) -> Result<&ManifestEntry, PoiArtifactError> {
@@ -272,7 +284,18 @@ where
     Ok(ObservedManifest {
         manifest,
         publication_id,
+        serving_gateway_index: None,
     })
+}
+
+/// Returns the durable publisher manifest sequence, including a migrated
+/// hashless floor, for use as the IPNS resolution sequence floor.
+pub(crate) fn publisher_manifest_sequence(
+    db: &DbStore,
+    publisher_pubkey: FixedBytes<32>,
+) -> Result<Option<u64>, PoiArtifactError> {
+    let _publication_fence = lock_poi_artifact_publication();
+    Ok(publisher_manifest_watermark(db, publisher_pubkey)?.map(|record| record.accepted_sequence))
 }
 
 pub(crate) struct PersistedPoiArtifactCache {

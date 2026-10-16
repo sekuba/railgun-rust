@@ -34,7 +34,7 @@ use crate::poi_artifacts::{
     PoiCorpusCompactionResult, PoiCorpusStore, PublicRpcPersistResult, RawChunkCache,
     RawChunkRetainOutcome, SemanticVerifiedChunk, TransportVerifiedChunk, VerifiedBlockedShields,
     VerifiedCatalog, VerifiedCorpusCandidate, observe_manifest_with_clock, persist_prepared_corpus,
-    prepare_candidate, prepare_candidate_from_starting_for_generation,
+    prepare_candidate, prepare_candidate_from_starting_for_generation, publisher_manifest_sequence,
 };
 use crate::poi_cache::{PoiCacheRetryHandle, PoiCacheService, PoiPublicCacheResetLease};
 use crate::public_cache::{
@@ -390,6 +390,17 @@ impl PoiArtifactPersistenceHandle {
             acceptance_time,
         )
         .map_err(poi_artifact_persistence_error)
+    }
+
+    /// Reads the durable publisher manifest sequence, the floor below which an
+    /// IPNS record cannot close manifest resolution early.
+    pub(crate) async fn publisher_manifest_sequence(
+        &self,
+        trusted_publisher_pubkey: FixedBytes<32>,
+    ) -> Result<Option<u64>, PublicDataPlaneError> {
+        let _commit_guard = self.commit_fence.lock().await;
+        publisher_manifest_sequence(self.db.as_ref(), trusted_publisher_pubkey)
+            .map_err(poi_artifact_persistence_error)
     }
 
     pub async fn begin_candidate(

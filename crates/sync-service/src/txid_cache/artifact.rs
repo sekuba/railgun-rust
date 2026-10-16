@@ -194,7 +194,7 @@ impl TxidPublicArtifactSource {
         if !missing.is_empty() {
             chunks.extend(
                 self.client
-                    .fetch_chunks_bounded(&missing)
+                    .fetch_chunks_bounded_with_preferred_gateway(&missing, preferred_gateway_index)
                     .await
                     .map_err(TxidPublicCacheError::from)?,
             );

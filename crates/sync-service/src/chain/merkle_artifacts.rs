@@ -224,7 +224,13 @@ impl MerkleArtifactSession {
         let checkpoint_pages = if checkpoint_descriptors.is_empty() {
             Vec::new()
         } else {
-            match client.fetch_chunks_bounded(&checkpoint_descriptors).await {
+            match client
+                .fetch_chunks_bounded_with_preferred_gateway(
+                    &checkpoint_descriptors,
+                    preferred_gateway_index,
+                )
+                .await
+            {
                 Ok(chunks) => Self::decode_checkpoint_pages_best_effort(
                     chain.deployment.chain_id,
                     from_block,
@@ -301,6 +307,7 @@ impl MerkleArtifactSession {
         let commitment_chunks = client
             .fetch_chunks_bounded_with_progress(
                 &commitment_descriptors,
+                preferred_gateway_index,
                 |completed_chunks, total_chunks| {
                     send_merkle_artifact_chunk_progress(
                         progress_tx,

@@ -79,21 +79,37 @@ impl PoiArtifactIngestor {
         F: Fn() -> SystemTime + Sync + ?Sized,
     {
         let name = ipns_name(&self.config.manifest_source)?;
+        // A record below the durable sequence would fail as rollback, so it
+        // must not close IPNS resolution early.
+        let sequence_floor = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
+            result = persistence.publisher_manifest_sequence(self.config.trusted_publisher_pubkey) => {
+                result.map_err(persistence_error)?
+            }
+        };
         let fetcher = self.fetcher();
         let candidates = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
-            result = fetcher.resolve_ipns_manifest_candidates_with_clock(name, acceptance_time) => result?,
+            result = fetcher.resolve_ipns_manifest_candidates_with_clock(
+                name,
+                sequence_floor,
+                acceptance_time,
+            ) => result?,
         };
         let mut last_error = None;
         for candidate in candidates {
             let candidate_cid = candidate.cid.to_string();
-            let bytes = tokio::select! {
+            let fetched = tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
-                result = fetcher.fetch_manifest_cid(&candidate_cid) => {
+                result = fetcher.fetch_manifest_cid_with_metadata_from_gateway(
+                    &candidate_cid,
+                    Some(candidate.gateway_index()),
+                ) => {
                     match result {
-                        Ok(bytes) => bytes,
+                        Ok(fetched) => fetched,
                         Err(error) => {
                             last_error = Some(PoiArtifactError::Trustless(error));
                             continue;
@@ -101,7 +117,7 @@ impl PoiArtifactIngestor {
                     }
                 }
             };
-            let manifest = match Manifest::read_envelope(&bytes) {
+            let manifest = match Manifest::read_envelope(fetched.bytes()) {
                 Ok(manifest) => manifest,
                 Err(error) => {
                     last_error = Some(PoiArtifactError::Format(error));
@@ -119,7 +135,10 @@ impl PoiArtifactIngestor {
                 ) => result,
             };
             match observation {
-                Ok(observed) => return Ok(observed),
+                Ok(mut observed) => {
+                    observed.set_serving_gateway_index(fetched.gateway_index());
+                    return Ok(observed);
+                }
                 Err(error) => last_error = Some(persistence_error(error)),
             }
         }
@@ -151,10 +170,10 @@ impl PoiArtifactIngestor {
             PoiArtifactCacheGraphProgress::default(),
         );
         let catalog_fetched = self
-            .fetch_artifact(
+            .fetch_catalog(
                 &entry.checkpoint_catalog.artifact.cid,
                 entry.checkpoint_catalog.artifact.byte_size,
-                0,
+                observed.serving_gateway_index(),
                 cancel,
             )
             .await?;
@@ -221,7 +240,9 @@ impl PoiArtifactIngestor {
             .fetch_artifact(
                 &entry.blocked_shields.artifact.cid,
                 entry.blocked_shields.artifact.byte_size,
-                plan.route.descriptors.len(),
+                observed
+                    .serving_gateway_index()
+                    .unwrap_or(plan.route.descriptors.len()),
                 cancel,
             )
             .await?;
@@ -323,7 +344,7 @@ impl PoiArtifactIngestor {
                     .fetch_artifact(
                         &descriptor.artifact.cid,
                         descriptor.artifact.byte_size,
-                        index,
+                        observed.serving_gateway_index().unwrap_or(index),
                         cancel,
                     )
                     .await?;
@@ -397,6 +418,29 @@ impl PoiArtifactIngestor {
             biased;
             () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
             result = fetcher.fetch_artifact_cid_with_metadata_from_gateway_bounded(
+                cid,
+                byte_size,
+                preferred_gateway_index,
+                MAX_GATEWAY_ATTEMPTS,
+            ) => result?,
+        };
+        Ok(FetchedArtifact::from_trustless(fetched))
+    }
+
+    /// Fetches a checkpoint catalog, starting at the gateway that served the
+    /// manifest and hedging gateways that stall before responding.
+    async fn fetch_catalog(
+        &self,
+        cid: &str,
+        byte_size: u64,
+        preferred_gateway_index: Option<usize>,
+        cancel: &CancellationToken,
+    ) -> Result<FetchedArtifact, PoiArtifactError> {
+        let fetcher = self.fetcher();
+        let fetched = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(PoiArtifactError::Cancelled),
+            result = fetcher.fetch_catalog_cid_with_metadata_hedged(
                 cid,
                 byte_size,
                 preferred_gateway_index,
@@ -776,15 +820,19 @@ mod tests {
     use super::*;
     use alloy::primitives::FixedBytes;
     use cid::Cid;
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{Signer, SigningKey};
     use libp2p_identity::Keypair;
     use local_db::{DbConfig, DbStore};
     use multihash_codetable::{Code, MultihashDigest};
-    use poi::artifacts::ArtifactDescriptor;
     use poi::artifacts::v4::{
-        ArtifactEncoding, BlockedShieldsDescriptor, CheckpointCatalogDescriptor, Compression,
-        EventArtifactKind, EventRange, FORMAT_VERSION,
+        ArtifactEncoding, BlockedShieldsArtifact, BlockedShieldsDescriptor, CheckpointCatalog,
+        CheckpointCatalogDescriptor, Compression, EventArtifact, EventArtifactKind, EventRange,
+        FORMAT_VERSION,
     };
+    use poi::artifacts::verify::canonical_poi_event_message;
+    use poi::artifacts::{ArtifactDescriptor, SnapshotEvent};
+    use poi::cache::PoiCache;
+    use poi::poi::{PoiEventType, SignedPoiEvent};
     use std::fs;
     use std::io::ErrorKind;
     use std::net::TcpListener;
@@ -983,6 +1031,411 @@ mod tests {
         );
         drop(db);
         fs::remove_dir_all(root_dir).expect("remove all-expired IPNS DB root");
+    }
+
+    #[tokio::test]
+    async fn lagging_ipns_record_below_watermark_does_not_hide_current_manifest() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create lagging IPNS DB root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open lagging IPNS DB"),
+        );
+        let signing_key = SigningKey::from_bytes(&[0xa6; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        crate::poi_artifacts::test_support::observe_manifest(
+            db.as_ref(),
+            publisher,
+            signed_empty_manifest(&signing_key, 9_500, 11),
+            Some(Duration::from_secs(1)),
+            UNIX_EPOCH + Duration::from_secs(10),
+        )
+        .expect("seed accepted manifest watermark");
+        let current_bytes = signed_empty_manifest(&signing_key, 10_500, 12)
+            .to_bytes()
+            .expect("encode current manifest");
+        let current_cid = delayed_raw_cid(&current_bytes).to_string();
+        let ipns_keypair = Keypair::ed25519_from_bytes([0xb4; 32]).expect("lagging IPNS keypair");
+        let ipns_name = test_ipns_name(&ipns_keypair);
+        let lagging_record = test_ipns_record(
+            &ipns_keypair,
+            &delayed_raw_cid(b"lagging manifest").to_string(),
+            10,
+        );
+        let current_record = test_ipns_record(&ipns_keypair, &current_cid, 12);
+        let (lagging_gateway, _lagging_requests) = spawn_routed_gateway(move |path| {
+            if path.starts_with("/ipns/") {
+                TestGatewayReply::Respond(200, lagging_record.clone())
+            } else {
+                TestGatewayReply::Respond(404, Vec::new())
+            }
+        });
+        let current_path = format!("/ipfs/{current_cid}");
+        let (current_gateway, _current_requests) = spawn_routed_gateway(move |path| {
+            if path.starts_with("/ipns/") {
+                // Answer after the IPNS early-close grace window would have
+                // closed resolution on the lagging record.
+                TestGatewayReply::Delayed(Duration::from_secs(3), 200, current_record.clone())
+            } else if path.starts_with(&current_path) {
+                TestGatewayReply::Respond(200, current_bytes.clone())
+            } else {
+                TestGatewayReply::Respond(404, Vec::new())
+            }
+        });
+        let ingestor = PoiArtifactIngestor::new(
+            crate::types::PoiArtifactSourceConfig {
+                trusted_publisher_pubkey: publisher,
+                manifest_source: PoiArtifactManifestSource::IpnsName(ipns_name),
+                gateway_urls: vec![lagging_gateway.into(), current_gateway.into()],
+                gateway_pool: None,
+                max_manifest_age: Some(Duration::from_secs(1)),
+            },
+            reqwest::Client::new(),
+        );
+        let persistence = PoiArtifactPersistenceHandle::new(
+            Arc::clone(&db),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        let accepted_at = UNIX_EPOCH + Duration::from_secs(11);
+
+        let observed = ingestor
+            .fetch_observed_manifest_with_clock(&persistence, &CancellationToken::new(), &|| {
+                accepted_at
+            })
+            .await
+            .expect("current manifest is accepted despite the lagging gateway");
+
+        assert_eq!(observed.manifest().sequence, 12);
+        assert_eq!(observed.serving_gateway_index(), Some(1));
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove lagging IPNS DB root");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_catalog_fetch_starts_at_manifest_gateway() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create catalog gateway DB root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open catalog gateway DB"),
+        );
+        let signing_key = SigningKey::from_bytes(&[0xa5; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let catalog = CheckpointCatalog::new(scope(), Vec::new()).expect("empty catalog");
+        let catalog_cid = delayed_raw_cid(&catalog.to_bytes().expect("encode catalog")).to_string();
+        let blocked_bytes = BlockedShieldsArtifact::from_signed_records(scope(), &[])
+            .to_bytes()
+            .expect("encode blocked shields");
+        let entry = ManifestEntry {
+            scope: scope(),
+            event_count: 0,
+            current_tip_index: None,
+            current_root: None,
+            checkpoint_catalog: catalog
+                .descriptor(catalog_cid.clone())
+                .expect("describe catalog"),
+            current_tail: None,
+            retained_bridges: Vec::new(),
+            blocked_shields: BlockedShieldsDescriptor {
+                artifact: ArtifactDescriptor::from_bytes(
+                    delayed_raw_cid(&blocked_bytes).to_string(),
+                    &blocked_bytes,
+                ),
+                format_version: FORMAT_VERSION,
+                scope: scope(),
+                row_count: 0,
+                encoding: ArtifactEncoding::CanonicalJson,
+                compression: Compression::Identity,
+            },
+        };
+        let mut manifest = Manifest::new(9_500, 7, publisher, vec![entry]);
+        manifest
+            .sign_manifest(&signing_key)
+            .expect("sign catalog manifest");
+        let manifest_bytes = manifest.to_bytes().expect("encode catalog manifest");
+        let manifest_path = format!("/ipfs/{}", delayed_raw_cid(&manifest_bytes));
+        let ipns_keypair = Keypair::ed25519_from_bytes([0xb3; 32]).expect("catalog IPNS keypair");
+        let ipns_name = test_ipns_name(&ipns_keypair);
+        let ipns_record = test_ipns_record(
+            &ipns_keypair,
+            &delayed_raw_cid(&manifest_bytes).to_string(),
+            7,
+        );
+        let catalog_path = format!("/ipfs/{catalog_cid}");
+        // The first configured gateway fails the manifest request and stalls on
+        // artifacts; the second serves the IPNS record and the manifest.
+        let (artifact_stalling_gateway, artifact_stalling_requests) = spawn_routed_gateway({
+            let catalog_path = catalog_path.clone();
+            move |path| {
+                if path.starts_with(&catalog_path) {
+                    TestGatewayReply::Stall
+                } else {
+                    TestGatewayReply::Respond(404, Vec::new())
+                }
+            }
+        });
+        let (manifest_gateway, manifest_gateway_requests) = spawn_routed_gateway(move |path| {
+            if path.starts_with("/ipns/") {
+                TestGatewayReply::Respond(200, ipns_record.clone())
+            } else if path.starts_with(&manifest_path) {
+                TestGatewayReply::Respond(200, manifest_bytes.clone())
+            } else {
+                TestGatewayReply::Stall
+            }
+        });
+        let ingestor = PoiArtifactIngestor::new(
+            crate::types::PoiArtifactSourceConfig {
+                trusted_publisher_pubkey: publisher,
+                manifest_source: PoiArtifactManifestSource::IpnsName(ipns_name),
+                gateway_urls: vec![artifact_stalling_gateway.into(), manifest_gateway.into()],
+                gateway_pool: None,
+                max_manifest_age: Some(Duration::from_secs(1)),
+            },
+            reqwest::Client::new(),
+        );
+        let persistence = PoiArtifactPersistenceHandle::new(
+            Arc::clone(&db),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        let accepted_at = UNIX_EPOCH + Duration::from_secs(10);
+        let cancel = CancellationToken::new();
+        let observed = ingestor
+            .fetch_observed_manifest_with_clock(&persistence, &cancel, &|| accepted_at)
+            .await
+            .expect("manifest from the second gateway is accepted");
+        assert_eq!(observed.serving_gateway_index(), Some(1));
+
+        let prepare = ingestor.prepare_cache_with_observed_manifest(
+            &persistence,
+            PoiCacheIdentity::new(0, 1, "V2_PoseidonMerkle", root(0x33)),
+            &observed,
+            None,
+            ExpectedPoiCorpusBase::NoValidCorpus,
+            0,
+            &cancel,
+        );
+        let first_catalog_request = async {
+            let wait_path = catalog_path.clone();
+            tokio::task::spawn_blocking(move || {
+                loop {
+                    let path = manifest_gateway_requests
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("catalog request reaches the manifest gateway");
+                    if path.starts_with(&wait_path) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("join catalog request wait");
+            let earlier = artifact_stalling_requests.try_iter().collect::<Vec<_>>();
+            assert!(
+                earlier.iter().all(|path| !path.starts_with(&catalog_path)),
+                "the first configured gateway received the catalog request first: {earlier:?}"
+            );
+            cancel.cancel();
+        };
+        let (result, ()) = tokio::join!(prepare, first_catalog_request);
+
+        assert!(matches!(result, Err(PoiArtifactError::Cancelled)));
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove catalog gateway DB root");
+    }
+
+    #[tokio::test]
+    async fn event_and_blocked_shield_fetches_start_at_manifest_gateway() {
+        let root_dir = temp_db_root();
+        fs::create_dir_all(&root_dir).expect("create event gateway DB root");
+        let db = Arc::new(
+            DbStore::open(DbConfig {
+                root_dir: root_dir.clone(),
+            })
+            .expect("open event gateway DB"),
+        );
+        let signing_key = SigningKey::from_bytes(&[0xa7; 32]);
+        let publisher = FixedBytes::from(signing_key.verifying_key().to_bytes());
+        let scope = Scope::new(publisher, 0, 1, "V2_PoseidonMerkle");
+        let identity = PoiCacheIdentity::new(0, 1, "V2_PoseidonMerkle", publisher);
+        let events = [0x11_u8, 0x12]
+            .into_iter()
+            .zip(0_u64..)
+            .map(|(commitment, index)| {
+                let message = canonical_poi_event_message(&SignedPoiEvent {
+                    index,
+                    blinded_commitment: FixedBytes::from([commitment; 32]),
+                    signature: String::new(),
+                    event_type: PoiEventType::Shield,
+                });
+                SnapshotEvent {
+                    event_index: index,
+                    blinded_commitment: [commitment; 32],
+                    signature: signing_key.sign(&message).to_bytes(),
+                    event_type: PoiEventType::Shield,
+                }
+            })
+            .collect::<Vec<_>>();
+        let root_after = |count: usize| {
+            let mut cache = PoiCache::new(identity.clone());
+            cache
+                .apply_verified_artifact_events(&events[..count])
+                .expect("apply test events");
+            cache.accept_current_roots();
+            *cache.current_roots().get(&0).expect("test root")
+        };
+        let (checkpoint_root, tail_root) = (root_after(1), root_after(2));
+
+        // Every artifact is served as a single-block CAR under its raw CID.
+        let mut artifacts = Vec::new();
+        let mut publish = |bytes: Vec<u8>| {
+            let cid = delayed_raw_cid(&bytes);
+            artifacts.push((format!("/ipfs/{cid}"), single_block_car(cid, &bytes)));
+            cid.to_string()
+        };
+        let checkpoint = EventArtifact::new(
+            scope.clone(),
+            EventArtifactKind::Checkpoint,
+            None,
+            checkpoint_root,
+            events[..1].to_vec(),
+        )
+        .expect("checkpoint chunk");
+        let checkpoint = checkpoint
+            .descriptor(publish(
+                checkpoint.to_bytes().expect("encode checkpoint chunk"),
+            ))
+            .expect("describe checkpoint chunk");
+        let tail = EventArtifact::new(
+            scope.clone(),
+            EventArtifactKind::CurrentTail,
+            Some(checkpoint_root),
+            tail_root,
+            events[1..].to_vec(),
+        )
+        .expect("tail chunk");
+        let tail = tail
+            .descriptor(publish(tail.to_bytes().expect("encode tail chunk")))
+            .expect("describe tail chunk");
+        let catalog =
+            CheckpointCatalog::new(scope.clone(), vec![checkpoint.clone()]).expect("catalog");
+        let catalog = catalog
+            .descriptor(publish(catalog.to_bytes().expect("encode catalog")))
+            .expect("describe catalog");
+        let blocked_bytes = BlockedShieldsArtifact::from_signed_records(scope.clone(), &[])
+            .to_bytes()
+            .expect("encode blocked shields");
+        let blocked =
+            ArtifactDescriptor::from_bytes(publish(blocked_bytes.clone()), &blocked_bytes);
+        let event_artifact_paths = [&checkpoint.artifact.cid, &tail.artifact.cid, &blocked.cid]
+            .map(|cid| format!("/ipfs/{cid}"));
+        let entry = ManifestEntry {
+            scope: scope.clone(),
+            event_count: 2,
+            current_tip_index: Some(1),
+            current_root: Some(tail_root),
+            checkpoint_catalog: catalog,
+            current_tail: Some(tail),
+            retained_bridges: Vec::new(),
+            blocked_shields: BlockedShieldsDescriptor {
+                artifact: blocked,
+                format_version: FORMAT_VERSION,
+                scope,
+                row_count: 0,
+                encoding: ArtifactEncoding::CanonicalJson,
+                compression: Compression::Identity,
+            },
+        };
+        let mut manifest = Manifest::new(9_500, 7, publisher, vec![entry]);
+        manifest
+            .sign_manifest(&signing_key)
+            .expect("sign event manifest");
+        let manifest_bytes = manifest.to_bytes().expect("encode event manifest");
+        let manifest_cid = delayed_raw_cid(&manifest_bytes).to_string();
+        let manifest_path = format!("/ipfs/{manifest_cid}");
+        let ipns_keypair = Keypair::ed25519_from_bytes([0xb5; 32]).expect("event IPNS keypair");
+        let ipns_name = test_ipns_name(&ipns_keypair);
+        let ipns_record = test_ipns_record(&ipns_keypair, &manifest_cid, 7);
+        // The first configured gateway has no IPNS record and stalls on every
+        // CID request; the second serves the record, manifest and artifacts.
+        let (artifact_stalling_gateway, artifact_stalling_requests) =
+            spawn_routed_gateway(|path| {
+                if path.starts_with("/ipns/") {
+                    TestGatewayReply::Respond(404, Vec::new())
+                } else {
+                    TestGatewayReply::Stall
+                }
+            });
+        let (manifest_gateway, manifest_gateway_requests) = spawn_routed_gateway(move |path| {
+            if path.starts_with("/ipns/") {
+                TestGatewayReply::Respond(200, ipns_record.clone())
+            } else if path.starts_with(&manifest_path) {
+                TestGatewayReply::Respond(200, manifest_bytes.clone())
+            } else if let Some((_, car)) = artifacts
+                .iter()
+                .find(|(artifact_path, _)| path.starts_with(artifact_path))
+            {
+                TestGatewayReply::Respond(200, car.clone())
+            } else {
+                TestGatewayReply::Respond(404, Vec::new())
+            }
+        });
+        let ingestor = PoiArtifactIngestor::new(
+            crate::types::PoiArtifactSourceConfig {
+                trusted_publisher_pubkey: publisher,
+                manifest_source: PoiArtifactManifestSource::IpnsName(ipns_name),
+                gateway_urls: vec![artifact_stalling_gateway.into(), manifest_gateway.into()],
+                gateway_pool: None,
+                max_manifest_age: Some(Duration::from_secs(1)),
+            },
+            reqwest::Client::new(),
+        );
+        let persistence = PoiArtifactPersistenceHandle::new(
+            Arc::clone(&db),
+            Arc::new(tokio::sync::Mutex::new(())),
+        );
+        let accepted_at = UNIX_EPOCH + Duration::from_secs(10);
+        let cancel = CancellationToken::new();
+        let observed = ingestor
+            .fetch_observed_manifest_with_clock(&persistence, &cancel, &|| accepted_at)
+            .await
+            .expect("manifest from the second gateway is accepted");
+        assert_eq!(observed.serving_gateway_index(), Some(1));
+
+        // An attempt started on the stalling gateway would wait for its
+        // response header limit, well past this bound.
+        let prepared = tokio::time::timeout(
+            Duration::from_secs(5),
+            ingestor.prepare_cache_with_observed_manifest(
+                &persistence,
+                identity,
+                &observed,
+                None,
+                ExpectedPoiCorpusBase::NoValidCorpus,
+                0,
+                &cancel,
+            ),
+        )
+        .await
+        .expect("no event artifact fetch starts at the stalling gateway")
+        .expect("prepare corpus from the manifest gateway");
+        assert!(prepared.is_some());
+        let served = manifest_gateway_requests.try_iter().collect::<Vec<_>>();
+        let stalled = artifact_stalling_requests.try_iter().collect::<Vec<_>>();
+        for artifact_path in &event_artifact_paths {
+            assert!(
+                served.iter().any(|path| path.starts_with(artifact_path)),
+                "the manifest gateway did not serve {artifact_path}: {served:?}"
+            );
+            assert!(
+                stalled.iter().all(|path| !path.starts_with(artifact_path)),
+                "the stalling gateway received {artifact_path}: {stalled:?}"
+            );
+        }
+        drop(db);
+        fs::remove_dir_all(root_dir).expect("remove event gateway DB root");
     }
 
     #[test]
@@ -1476,6 +1929,90 @@ mod tests {
         (url, requests)
     }
 
+    enum TestGatewayReply {
+        Respond(u16, Vec<u8>),
+        Delayed(Duration, u16, Vec<u8>),
+        /// Holds the connection open without a response until the client
+        /// closes it.
+        Stall,
+    }
+
+    /// Serves each request on its own thread with the reply `route` picks for
+    /// its path, records every request path, and accepts connections for ten
+    /// seconds.
+    fn spawn_routed_gateway(
+        route: impl Fn(&str) -> TestGatewayReply + Send + Sync + 'static,
+    ) -> (Url, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind routed gateway");
+        let url = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("routed gateway address")
+        ))
+        .expect("routed gateway URL");
+        listener
+            .set_nonblocking(true)
+            .expect("set routed gateway nonblocking");
+        let route = Arc::new(route);
+        let (request_tx, requests) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("set routed request blocking");
+                        let route = Arc::clone(&route);
+                        let request_tx = request_tx.clone();
+                        std::thread::spawn(move || {
+                            let path = read_test_request_path(&mut stream);
+                            let reply = route(&path);
+                            let _ = request_tx.send(path);
+                            match reply {
+                                TestGatewayReply::Respond(status, body) => {
+                                    write_test_response(&mut stream, status, &body);
+                                }
+                                TestGatewayReply::Delayed(delay, status, body) => {
+                                    std::thread::sleep(delay);
+                                    write_test_response(&mut stream, status, &body);
+                                }
+                                TestGatewayReply::Stall => {
+                                    let mut buffer = [0_u8; 64];
+                                    while matches!(
+                                        std::io::Read::read(&mut stream, &mut buffer),
+                                        Ok(read) if read > 0
+                                    ) {}
+                                }
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("accept routed gateway request: {error}"),
+                }
+            }
+        });
+        (url, requests)
+    }
+
+    fn test_ipns_name(keypair: &Keypair) -> String {
+        Cid::new_v1(0x72, *keypair.public().to_peer_id().as_ref()).to_string()
+    }
+
+    fn test_ipns_record(keypair: &Keypair, cid: &str, sequence: u64) -> Vec<u8> {
+        rust_ipns::Record::new(
+            keypair,
+            cid,
+            chrono::Utc::now() + chrono::Duration::seconds(60 * 60 * 24 * 365),
+            sequence,
+            Duration::from_nanos(60),
+        )
+        .expect("test IPNS record")
+        .encode()
+        .expect("encode test IPNS record")
+    }
+
     fn read_test_request_path(stream: &mut std::net::TcpStream) -> String {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
@@ -1502,6 +2039,38 @@ mod tests {
         );
         std::io::Write::write_all(stream, headers.as_bytes()).expect("write test HTTP headers");
         std::io::Write::write_all(stream, body).expect("write test HTTP body");
+    }
+
+    /// A single-block `CARv1` whose root is the raw block itself.
+    fn single_block_car(root: Cid, block: &[u8]) -> Vec<u8> {
+        let mut cid_link = vec![0_u8];
+        cid_link.extend_from_slice(&root.to_bytes());
+        // DAG-CBOR `{"roots": [link], "version": 1}`.
+        let mut header = vec![0xa2, 0x65];
+        header.extend_from_slice(b"roots");
+        header.extend_from_slice(&[0x81, 0xd8, 0x2a, 0x58]);
+        header.push(u8::try_from(cid_link.len()).expect("CID link length"));
+        header.extend_from_slice(&cid_link);
+        header.push(0x67);
+        header.extend_from_slice(b"version");
+        header.push(0x01);
+
+        let cid_bytes = root.to_bytes();
+        let mut car = Vec::new();
+        write_test_varint(header.len(), &mut car);
+        car.extend_from_slice(&header);
+        write_test_varint(cid_bytes.len() + block.len(), &mut car);
+        car.extend_from_slice(&cid_bytes);
+        car.extend_from_slice(block);
+        car
+    }
+
+    fn write_test_varint(mut value: usize, out: &mut Vec<u8>) {
+        while value >= 0x80 {
+            out.push(u8::try_from(value & 0x7f).expect("varint low bits") | 0x80);
+            value >>= 7;
+        }
+        out.push(u8::try_from(value).expect("varint final byte"));
     }
 
     fn spawn_delayed_manifest_gateway(
