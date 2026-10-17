@@ -474,6 +474,8 @@ pub(crate) enum OwnedPoiPrivateDelta {
         now: u64,
         /// Set only when the commit consumes a proof built from the local corpus.
         expected_corpus: Option<ExpectedPoiCorpusRevision>,
+        /// Source scan epoch used to reconstruct missing sender notes.
+        replay_fence: Option<super::saved_poi_compatibility::SenderCandidateReplayFence>,
     },
     /// Apply a completed submission to the current context/recovery records.
     PendingSubmission {

@@ -2777,7 +2777,20 @@ async fn apply_poi_private_delta_inline(
             action,
             now,
             expected_corpus,
+            replay_fence,
         } => {
+            // Match sender reconstruction lock ordering: public data, then corpus, then commit.
+            let _public_commit_guard = match replay_fence.as_ref() {
+                Some(fence) => Some(fence.public_data_plane.acquire_commit_guard().await),
+                None => None,
+            };
+            if replay_fence
+                .as_ref()
+                .is_some_and(|fence| fence.public_data_plane.current_epoch() != fence.epoch)
+            {
+                drop(permit);
+                return Ok(PoiPrivateApplyOutcome::Skipped);
+            }
             // Held through the commit when this record consumes a local proof.
             let _revision_fence =
                 match hold_expected_poi_corpus_revision(expected_corpus.as_ref()).await {

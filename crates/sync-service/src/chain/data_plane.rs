@@ -1596,6 +1596,33 @@ impl ChainPublicDataPlane {
             .unwrap_or_else(PoisonError::into_inner) = Arc::downgrade(service);
     }
 
+    /// Reads recovery rows without exposing a wallet-selected block to query-based sources.
+    pub(crate) async fn output_poi_source_block_rows(
+        &self,
+        block_number: u64,
+    ) -> Result<PublicScanRowsAnswer, ChainError> {
+        let service = self
+            .scan_service
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade();
+        if let Some(service) = service {
+            return service.output_poi_source_block_rows(block_number).await;
+        }
+        Ok(
+            match self
+                .cached_wallet_scan_apply(block_number, block_number)
+                .await
+            {
+                Some(apply) => apply.into(),
+                None => PublicScanRowsAnswer::Missing {
+                    range: PublicScanRange::new(block_number, block_number),
+                    epoch: self.current_epoch(),
+                },
+            },
+        )
+    }
+
     pub(crate) async fn saved_poi_source_block_rows(
         &self,
         block_number: u64,

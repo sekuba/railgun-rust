@@ -361,6 +361,7 @@ pub(super) struct RecoveryChunk {
     pub(super) chunk: TransactionPlanChunk,
     pub(super) output_start_global: u128,
     pub(super) target_txid_index: Option<u64>,
+    pub(super) replay_fence: Option<super::saved_poi_compatibility::SenderCandidateReplayFence>,
 }
 
 #[derive(Debug, Clone)]
@@ -798,6 +799,7 @@ pub(super) async fn recover_missing_output_pois(request: OutputPoiRecoveryReques
                         },
                         now,
                         expected_corpus: proof_source_resolution.expected_corpus_revision(),
+                        replay_fence: recovery_chunk.replay_fence.clone(),
                     },
                 )
                 .await
@@ -1257,6 +1259,7 @@ pub(super) async fn build_output_poi_recovery_chunk_from_public_cache(
         },
         DEFAULT_TXID_VERSION,
     );
+    let public_epoch = request.public_data_plane.current_epoch();
     let rows = public_txid_rows_for_outer_hash(
         PublicCacheTxidRefreshRequest {
             public_data_plane: request.public_data_plane,
@@ -1310,7 +1313,110 @@ pub(super) async fn build_output_poi_recovery_chunk_from_public_cache(
         spending_public_key,
         &request.cfg.scan_keys,
     )
-    .await?;
+    .await;
+    let recovery_chunk = match recovery_chunk {
+        Err(failure)
+            if failure.category == "sender_output_notes_unavailable"
+                && wallet_nullifiers
+                    .wallet_utxos
+                    .iter()
+                    .any(|input| input.spent.as_ref() == Some(&candidate.utxo.source)) =>
+        {
+            let replay_failure = |category, message| {
+                RecoveryFailure::retryable_category(
+                    OutputPoiRecoveryStatus::TxFetchFailed,
+                    category,
+                    message,
+                    OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+                )
+            };
+            let source_rows = match request
+                .public_data_plane
+                .output_poi_source_block_rows(candidate.utxo.source.block_number)
+                .await
+            {
+                Ok(crate::chain::PublicScanRowsAnswer::Rows(rows)) => rows,
+                Ok(_) => {
+                    return Err(replay_failure(
+                        "sender_source_rows_unavailable",
+                        "sender output source block is not available in public artifacts",
+                    ));
+                }
+                Err(_) => {
+                    return Err(replay_failure(
+                        "sender_source_rows_fetch_failed",
+                        "sender output source block could not be loaded from public artifacts",
+                    ));
+                }
+            };
+            if request.authority.revalidate().is_err()
+                || source_rows.range.from_block > candidate.utxo.source.block_number
+                || source_rows.range.to_block < candidate.utxo.source.block_number
+                || source_rows.epoch != public_epoch
+                || request.public_data_plane.current_epoch() != public_epoch
+            {
+                return Err(replay_failure(
+                    "sender_source_rows_stale",
+                    "sender output source block changed while reconstructing recovery notes",
+                ));
+            }
+            let delta = super::WalletLogDelta::from_rows(&source_rows.rows, &request.cfg.scan_keys);
+            let nullifiers = delta
+                .nullifiers
+                .into_iter()
+                .map(|spent| ((spent.tree, spent.nullifier), spent.source))
+                .collect();
+            let candidates = super::delta::sender_scan_candidate_inputs(
+                wallet_nullifiers.wallet_utxos,
+                request.cfg.scan_keys.nullifying_key,
+                &nullifiers,
+                delta.sender_scan_outputs,
+                &request.cfg.scan_keys,
+            );
+            let mut candidates = candidates
+                .into_iter()
+                .filter(|sender| sender.source == candidate.utxo.source);
+            let Some(sender) = candidates.next() else {
+                return Err(failure);
+            };
+            if candidates.next().is_some() {
+                return Err(failure);
+            }
+            let sender = sender
+                .into_record(request.cfg.chain.chain_id, request.cfg.cache_key.clone())
+                .map_err(|_| failure)?;
+            let mut chunk = build_output_poi_recovery_chunk_from_public_rows(
+                candidate,
+                wallet_nullifiers,
+                &rows,
+                Some(&sender),
+                &cached_transactions,
+                &request.forest,
+                required_poi_list_keys,
+                spending_public_key,
+                &request.cfg.scan_keys,
+            )
+            .await?;
+            chunk.replay_fence = Some(super::saved_poi_compatibility::SenderCandidateReplayFence {
+                public_data_plane: request.public_data_plane.clone(),
+                epoch: public_epoch,
+            });
+            chunk
+        }
+        result => result?,
+    };
+    if recovery_chunk
+        .replay_fence
+        .as_ref()
+        .is_some_and(|fence| fence.public_data_plane.current_epoch() != fence.epoch)
+    {
+        return Err(RecoveryFailure::retryable_category(
+            OutputPoiRecoveryStatus::TxFetchFailed,
+            "sender_source_rows_stale",
+            "sender output source block changed while building recovery chunk",
+            OUTPUT_POI_RECOVERY_TRANSIENT_RETRY_AFTER,
+        ));
+    }
     if !request
         .candidate_still_current(candidate, required_poi_list_keys)
         .await
@@ -1958,6 +2064,7 @@ pub(super) async fn build_recovery_chunk_for_public_transaction(
         },
         output_start_global,
         target_txid_index,
+        replay_fence: None,
     })
 }
 
@@ -2127,6 +2234,7 @@ fn build_recovery_chunk_for_transaction(
         },
         output_start_global,
         target_txid_index,
+        replay_fence: None,
     })
 }
 
@@ -2594,6 +2702,7 @@ pub(super) async fn record_output_poi_recovery_failure(
             },
             now,
             expected_corpus: None,
+            replay_fence: None,
         },
     )
     .await
@@ -2656,6 +2765,7 @@ pub(super) async fn mark_valid_output_poi_recoveries(
                 action: OutputPoiRecoveryAction::Valid,
                 now,
                 expected_corpus: None,
+                replay_fence: None,
             },
         )
         .await

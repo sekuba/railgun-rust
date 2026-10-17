@@ -655,6 +655,77 @@ impl ChainService {
             .await
     }
 
+    /// Recovery may fetch whole indexed artifacts, but must not query a wallet-selected block.
+    pub(super) async fn output_poi_source_block_rows(
+        &self,
+        block_number: u64,
+    ) -> Result<PublicScanRowsAnswer, ChainError> {
+        if let Some(apply) = self
+            .public_data_plane
+            .cached_wallet_scan_apply(block_number, block_number)
+            .await
+        {
+            return self.public_scan_answer_from_apply(apply).await;
+        }
+        let range = PublicScanRange::new(block_number, block_number);
+        let read_scope = self.begin_public_scan_read();
+        let session = IndexedWalletArtifactSession::prepare(
+            &self.chain,
+            block_number,
+            block_number,
+            read_scope,
+            &self.public_data_plane,
+            None,
+        )
+        .await;
+        let page = session.and_then(|session| {
+            let Some(session) = session else {
+                return Ok(None);
+            };
+            session
+                .page_for_block_range(block_number, block_number)
+                .map(|outcome| match outcome {
+                    IndexedWalletArtifactPageOutcome::Page(page) => Some(page),
+                    IndexedWalletArtifactPageOutcome::Exhausted { .. } => None,
+                })
+        });
+        let page = match page {
+            Ok(Some(page)) => page,
+            unavailable => {
+                if let Err(err) = unavailable {
+                    warn!(
+                        err = %WalletStartupSyncError::from(err).without_url(),
+                        "output POI source block artifacts failed"
+                    );
+                } else {
+                    debug!("output POI source block artifacts unavailable");
+                }
+                return Ok(PublicScanRowsAnswer::Missing {
+                    range,
+                    epoch: self.public_data_plane.current_epoch(),
+                });
+            }
+        };
+        let apply = WalletScanApply::indexed_rows(
+            block_number,
+            page.checkpoint_block,
+            page.into_scan_rows(),
+            read_scope,
+            WalletIndexedCatchUpSource::IndexedArtifacts,
+        );
+        self.record_public_scan_apply_result(&apply).await?;
+        self.public_data_plane
+            .record_source_decision(
+                PublicDataPlaneDiagnosticKind::SourceSelected,
+                PublicScanSource::IndexedArtifacts,
+                range,
+                read_scope,
+                "output POI source block artifact rows selected",
+            )
+            .await;
+        self.public_scan_answer_from_apply(apply).await
+    }
+
     async fn public_scan_rows_from_rpc(
         &self,
         source_range: PublicScanRange,
