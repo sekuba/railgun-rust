@@ -1542,7 +1542,7 @@ mod tests {
                 deployment_block: 0,
                 v2_start_block: 0,
                 legacy_shield_block: 0,
-                relay_adapt_contract: Address::ZERO,
+                relay_adapt_contract: None,
                 relay_adapt_7702_contract: Address::ZERO,
                 relay_adapt_history: &[],
             },

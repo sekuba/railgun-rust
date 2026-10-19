@@ -118,6 +118,13 @@ impl CompositeExecution {
     }
 }
 
+/// The adapter a composite request settles through when its plan needs one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompositeAdapter {
+    RelayAdapt(Address),
+    Executor(ExecutorContext),
+}
+
 #[derive(Debug, Clone)]
 pub struct InputWitness {
     pub utxo: Utxo,
@@ -419,12 +426,6 @@ impl PrivateInputs {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum UnshieldMode {
-    Token,
-    UnwrapBase,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeUnshieldRecipient {
     Public(Address),
@@ -474,7 +475,7 @@ pub struct CompositeRelayActions {
 
 #[derive(Debug, Clone)]
 pub struct CompositeUnshieldRequest {
-    pub executor: Option<ExecutorContext>,
+    pub adapter: Option<CompositeAdapter>,
     pub legs: Vec<CompositeUnshieldLeg>,
     pub relay_actions: Option<CompositeRelayActions>,
     pub broadcaster_fee: Option<BroadcasterFeeOutput>,
@@ -521,7 +522,7 @@ pub struct MixedPrivateActionRebuildConstraint {
 
 #[derive(Debug, Clone)]
 pub struct MixedPrivateActionRequest {
-    pub executor: Option<ExecutorContext>,
+    pub adapter: Option<CompositeAdapter>,
     /// Reviewed calls for an executor operation, authenticated after proof generation.
     /// Requires executor context and cannot be combined with legacy helper actions.
     pub executor_calls: Vec<Call>,
@@ -661,7 +662,6 @@ pub struct UnshieldRequest {
     pub token_address: Address,
     pub amount: U256,
     pub recipient: Address,
-    pub mode: UnshieldMode,
     pub verify_proof: bool,
     pub spend_up_to: bool,
     pub broadcaster_fee: Option<BroadcasterFeeOutput>,
@@ -816,5 +816,4 @@ pub struct TransactionBuilder {
     pub chain_type: u8,
     pub chain_id: u64,
     pub railgun_contract: Address,
-    pub relay_adapt_contract: Address,
 }

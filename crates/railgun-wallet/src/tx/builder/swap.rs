@@ -18,8 +18,9 @@ use broadcaster_core::contracts::railgun::{
 use broadcaster_core::utxo::Utxo;
 
 use super::super::{
-    BuildError, CompositeUnshieldLeg, CompositeUnshieldRecipient, MAX_BATCH_TRANSACTIONS,
-    MixedPrivateActionPreview, MixedPrivateActionRequest, TransactionBuilder, TransactionShape,
+    BuildError, CompositeAdapter, CompositeUnshieldLeg, CompositeUnshieldRecipient,
+    MAX_BATCH_TRANSACTIONS, MixedPrivateActionPreview, MixedPrivateActionRequest,
+    TransactionBuilder, TransactionShape,
 };
 use super::selection::{
     max_batch_selection, max_tree_total_below, remove_selected_utxos, token_utxos_by_tree,
@@ -365,7 +366,9 @@ impl TransactionBuilder {
 fn swap_leg(
     request: &MixedPrivateActionRequest,
 ) -> Result<(Address, CompositeUnshieldLeg), BuildError> {
-    let executor = request.executor.ok_or(BuildError::InvalidExecutorContext)?;
+    let Some(CompositeAdapter::Executor(executor)) = request.adapter else {
+        return Err(BuildError::InvalidExecutorContext);
+    };
     match request.public_unshields.as_slice() {
         [leg]
             if leg.recipient == CompositeUnshieldRecipient::RelayAdapt

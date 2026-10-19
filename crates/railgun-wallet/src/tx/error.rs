@@ -23,14 +23,16 @@ pub enum BuildError {
     SignatureInputLimit { inputs: usize, outputs: usize },
     #[error("missing merkle root")]
     MissingRoot,
-    #[error("missing action data for unwrap")]
-    MissingActionData,
     #[error("composite unshield request must include at least one leg")]
     EmptyCompositeUnshieldRequest,
     #[error("mixed private action request must include a private send or public unshield")]
     EmptyMixedPrivateActionRequest,
     #[error("RelayAdapt composite legs require at least one RelayAdapt action")]
     MissingCompositeRelayActions,
+    #[error("composite plan needs an adapter but the request names none")]
+    MissingCompositeAdapter,
+    #[error("request names a RelayAdapt contract but the plan needs no adapter")]
+    UnusedRelayAdapt,
     #[error("executor context does not match the chain or adapter operation")]
     InvalidExecutorContext,
     #[error("executor calls cannot be combined with RelayAdapt helper actions")]

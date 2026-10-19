@@ -21,16 +21,16 @@ use crate::notes::{Note, NoteCiphertext};
 use crate::prover::{ProverError, ProverService};
 
 use super::{
-    BroadcasterFeeOutput, BuildError, CompositeExecution, CompositePlanShape,
+    BroadcasterFeeOutput, BuildError, CompositeAdapter, CompositeExecution, CompositePlanShape,
     CompositePrivateOutputRole, CompositePrivateOutputRoleKind, CompositeUnshieldLeg,
     CompositeUnshieldLegMetadata, CompositeUnshieldPlan, CompositeUnshieldPlannedOutput,
-    CompositeUnshieldRequest, ExecutorContext, InputWitness, MAX_BATCH_TRANSACTIONS,
-    MAX_CIRCUIT_INPUTS, MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan, MixedPrivateActionPreview,
+    CompositeUnshieldRequest, InputWitness, MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS,
+    MAX_SIGNATURE_INPUTS, MixedPrivateActionPlan, MixedPrivateActionPreview,
     MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource,
     MixedPrivatePlannedOutput, MixedPublicPlannedOutput, PrivateInputs, PublicInputs,
     SelectedInputIdentity, SendPlan, SendRequest, TransactPlan, TransactionBuilder,
-    TransactionCall, TransactionPlanChunk, TransactionShape, UNRELAYED_ADAPT_PARAMS, UnshieldMode,
-    UnshieldPlan, UnshieldRequest,
+    TransactionCall, TransactionPlanChunk, TransactionShape, UNRELAYED_ADAPT_PARAMS, UnshieldPlan,
+    UnshieldRequest,
 };
 
 use selection::{
@@ -68,15 +68,21 @@ impl TransactionBuilder {
     const fn composite_execution(
         &self,
         uses_adapter: bool,
-        executor: Option<ExecutorContext>,
+        adapter: Option<CompositeAdapter>,
     ) -> Result<CompositeExecution, BuildError> {
-        match (uses_adapter, executor) {
-            (true, Some(context)) if self.chain_type == 0 && context.chain_id == self.chain_id => {
+        match (uses_adapter, adapter) {
+            (false, None) => Ok(CompositeExecution::Direct(self.railgun_contract)),
+            (true, None) => Err(BuildError::MissingCompositeAdapter),
+            (true, Some(CompositeAdapter::RelayAdapt(contract))) => {
+                Ok(CompositeExecution::RelayAdapt(contract))
+            }
+            (false, Some(CompositeAdapter::RelayAdapt(_))) => Err(BuildError::UnusedRelayAdapt),
+            (true, Some(CompositeAdapter::Executor(context)))
+                if self.chain_type == 0 && context.chain_id == self.chain_id =>
+            {
                 Ok(CompositeExecution::Executor(context))
             }
-            (_, Some(_)) => Err(BuildError::InvalidExecutorContext),
-            (true, None) => Ok(CompositeExecution::RelayAdapt(self.relay_adapt_contract)),
-            (false, None) => Ok(CompositeExecution::Direct(self.railgun_contract)),
+            (_, Some(CompositeAdapter::Executor(_))) => Err(BuildError::InvalidExecutorContext),
         }
     }
 
@@ -208,7 +214,7 @@ impl TransactionBuilder {
             return Err(BuildError::MissingCompositeRelayActions);
         }
         let uses_relay_adapt = has_relay_adapt_leg || relay_call_count > 0;
-        let execution = self.composite_execution(uses_relay_adapt, request.executor)?;
+        let execution = self.composite_execution(uses_relay_adapt, request.adapter)?;
         let mut remaining_utxos = utxos.to_vec();
         let mut input_witness_cache = InputWitnessProofCache::new(forest);
         let receiver = viewing.address_data();
@@ -365,7 +371,6 @@ impl TransactionBuilder {
                     token_address: leg.token_address,
                     amount: allocation.amount,
                     recipient: unshield_to,
-                    mode: UnshieldMode::Token,
                     verify_proof: request.verify_proof,
                     spend_up_to: request.spend_up_to,
                     broadcaster_fee: allocation.fee,
@@ -468,7 +473,7 @@ impl TransactionBuilder {
             return Err(BuildError::EmptyMixedPrivateActionRequest);
         }
         if !request.executor_calls.is_empty() {
-            if request.executor.is_none() {
+            if !matches!(request.adapter, Some(CompositeAdapter::Executor(_))) {
                 return Err(BuildError::InvalidExecutorContext);
             }
             if request.relay_actions.is_some() {
@@ -489,9 +494,10 @@ impl TransactionBuilder {
         }
         // Executor plans always settle through `execute`, even with no calls, so the
         // executor signature also binds fee-only setup plans.
-        let uses_relay_adapt =
-            has_relay_adapt_leg || relay_call_count > 0 || request.executor.is_some();
-        let execution = self.composite_execution(uses_relay_adapt, request.executor)?;
+        let uses_relay_adapt = has_relay_adapt_leg
+            || relay_call_count > 0
+            || matches!(request.adapter, Some(CompositeAdapter::Executor(_)));
+        let execution = self.composite_execution(uses_relay_adapt, request.adapter)?;
         let candidate_utxos = request.rebuild.as_ref().map_or_else(
             || Ok(utxos.to_vec()),
             |constraint| resolve_pinned_utxos(utxos, &constraint.selected_inputs),
@@ -803,7 +809,6 @@ impl TransactionBuilder {
                     token_address: leg.token_address,
                     amount: allocation.amount,
                     recipient: unshield_to,
-                    mode: UnshieldMode::Token,
                     verify_proof: request.verify_proof,
                     spend_up_to: request.spend_up_to,
                     broadcaster_fee: None,
@@ -1011,10 +1016,6 @@ impl TransactionBuilder {
             None,
             request.spend_up_to,
         )?;
-        let unshield_to = match request.mode {
-            UnshieldMode::Token => request.recipient,
-            UnshieldMode::UnwrapBase => self.relay_adapt_contract,
-        };
         let mut unproven_plans = Vec::with_capacity(1 + action_selection.chunks.len());
         unproven_plans.push(fee_unproven_plan);
         let mut unshield_notes = Vec::with_capacity(action_selection.chunks.len());
@@ -1038,7 +1039,7 @@ impl TransactionBuilder {
             } = build_unshield_outputs(
                 request.token_address,
                 allocation.amount,
-                unshield_to,
+                request.recipient,
                 allocation.change,
                 &receiver,
                 None,
@@ -1055,29 +1056,6 @@ impl TransactionBuilder {
                 unshield_notes.last().expect("pushed unshield note"),
                 Some(&mut input_witness_cache),
             )?);
-        }
-
-        let action_data = if matches!(request.mode, UnshieldMode::UnwrapBase) {
-            let random = FixedBytes::<31>::from(rand_array());
-            Some(ActionData::unwrap_base(
-                self.relay_adapt_contract,
-                request.recipient,
-                random,
-                true,
-            ))
-        } else {
-            None
-        };
-        if let Some(action_data) = action_data.as_ref() {
-            let transactions = unproven_plans
-                .iter()
-                .map(|plan| &plan.transaction)
-                .collect::<Vec<_>>();
-            let adapt_params = action_data.adapt_params(&transactions);
-            for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
-                plan.transaction.boundParams.adaptParams = adapt_params;
-            }
         }
 
         let proven_plans =
@@ -1103,26 +1081,13 @@ impl TransactionBuilder {
             .expect("action selection has at least one chunk")
             .clone();
 
-        let call = if matches!(request.mode, UnshieldMode::UnwrapBase) {
-            let action_data = action_data.ok_or(BuildError::MissingActionData)?;
-            let data = relayCall {
-                _transactions: transactions,
-                _actionData: action_data,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.relay_adapt_contract,
-                data: data.into(),
-            }
-        } else {
-            let data = transactCall {
-                _transactions: transactions,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.railgun_contract,
-                data: data.into(),
-            }
+        let data = transactCall {
+            _transactions: transactions,
+        }
+        .abi_encode();
+        let call = TransactionCall {
+            to: self.railgun_contract,
+            data: data.into(),
         };
 
         Ok(UnshieldPlan {
@@ -1329,10 +1294,6 @@ impl TransactionBuilder {
             request.spend_up_to,
         )?;
         let receiver = viewing.address_data();
-        let unshield_to = match request.mode {
-            UnshieldMode::Token => request.recipient,
-            UnshieldMode::UnwrapBase => self.relay_adapt_contract,
-        };
 
         let mut unproven_plans = Vec::with_capacity(selection.chunks.len());
         let mut broadcaster_fee_note = None;
@@ -1358,7 +1319,7 @@ impl TransactionBuilder {
             } = build_unshield_outputs(
                 request.token_address,
                 allocation.amount,
-                unshield_to,
+                request.recipient,
                 allocation.change,
                 &receiver,
                 allocation.fee,
@@ -1378,29 +1339,6 @@ impl TransactionBuilder {
                 unshield_notes.last().expect("pushed unshield note"),
                 Some(&mut input_witness_cache),
             )?);
-        }
-
-        let action_data = if matches!(request.mode, UnshieldMode::UnwrapBase) {
-            let random = FixedBytes::<31>::from(rand_array());
-            Some(ActionData::unwrap_base(
-                self.relay_adapt_contract,
-                request.recipient,
-                random,
-                true,
-            ))
-        } else {
-            None
-        };
-        if let Some(action_data) = action_data.as_ref() {
-            let transactions = unproven_plans
-                .iter()
-                .map(|plan| &plan.transaction)
-                .collect::<Vec<_>>();
-            let adapt_params = action_data.adapt_params(&transactions);
-            for plan in &mut unproven_plans {
-                plan.transaction.boundParams.adaptContract = self.relay_adapt_contract;
-                plan.transaction.boundParams.adaptParams = adapt_params;
-            }
         }
 
         let proven_plans =
@@ -1429,26 +1367,13 @@ impl TransactionBuilder {
             .expect("selection has at least one chunk")
             .clone();
 
-        let call = if matches!(request.mode, UnshieldMode::UnwrapBase) {
-            let action_data = action_data.ok_or(BuildError::MissingActionData)?;
-            let data = relayCall {
-                _transactions: transactions,
-                _actionData: action_data,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.relay_adapt_contract,
-                data: data.into(),
-            }
-        } else {
-            let data = transactCall {
-                _transactions: transactions,
-            }
-            .abi_encode();
-            TransactionCall {
-                to: self.railgun_contract,
-                data: data.into(),
-            }
+        let data = transactCall {
+            _transactions: transactions,
+        }
+        .abi_encode();
+        let call = TransactionCall {
+            to: self.railgun_contract,
+            data: data.into(),
         };
 
         Ok(UnshieldPlan {

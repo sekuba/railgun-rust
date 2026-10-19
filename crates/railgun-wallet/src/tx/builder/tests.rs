@@ -26,18 +26,18 @@ use crate::artifacts::ArtifactSource;
 use crate::keys::{RailgunSpendSigner, WalletKeys};
 use crate::prover::{ProverError, ProverService};
 use crate::tx::{
-    BroadcasterFeeOutput, BuildError, CompositeExecution, CompositePrivateOutputRoleKind,
-    CompositeRelayAction, CompositeRelayActionToken, CompositeRelayActions, CompositeUnshieldLeg,
-    CompositeUnshieldLegRole, CompositeUnshieldRecipient, CompositeUnshieldRequest,
-    ExecutorContext, InputWitness, MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS,
-    MixedPrivateActionRebuildConstraint, MixedPrivateActionRequest, MixedPrivateOutputRole,
-    MixedPrivateOutputSource, MixedPrivateSend, MixedPrivateSendRole, PoiCircuitVariant,
-    PoiMerkleProofSource, PostTransactionPoiData, PostTransactionPoiGenerationRequest,
-    PreTransactionPoiError, PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs,
-    SelectedInputIdentity, SendRequest, TransactionBuilder, TransactionCall, TransactionPlanChunk,
-    UNRELAYED_ADAPT_PARAMS, compute_railgun_txid_from_public_inputs,
-    generate_post_transaction_pois, generate_pre_transaction_pois, insert_pre_transaction_poi,
-    poi_circuit_variant,
+    BroadcasterFeeOutput, BuildError, CompositeAdapter, CompositeExecution,
+    CompositePrivateOutputRoleKind, CompositeRelayAction, CompositeRelayActionToken,
+    CompositeRelayActions, CompositeUnshieldLeg, CompositeUnshieldLegRole,
+    CompositeUnshieldRecipient, CompositeUnshieldRequest, ExecutorContext, InputWitness,
+    MAX_BATCH_TRANSACTIONS, MAX_CIRCUIT_INPUTS, MixedPrivateActionRebuildConstraint,
+    MixedPrivateActionRequest, MixedPrivateOutputRole, MixedPrivateOutputSource, MixedPrivateSend,
+    MixedPrivateSendRole, PoiCircuitVariant, PoiMerkleProofSource, PostTransactionPoiData,
+    PostTransactionPoiGenerationRequest, PreTransactionPoiError,
+    PreTransactionPoiGenerationRequest, PrivateInputs, PublicInputs, SelectedInputIdentity,
+    SendRequest, TransactionBuilder, TransactionCall, TransactionPlanChunk, UNRELAYED_ADAPT_PARAMS,
+    compute_railgun_txid_from_public_inputs, generate_post_transaction_pois,
+    generate_pre_transaction_pois, insert_pre_transaction_poi, poi_circuit_variant,
 };
 
 use super::{
@@ -236,12 +236,13 @@ fn test_wallet() -> WalletKeys {
     .expect("valid mnemonic")
 }
 
+const TEST_RELAY_ADAPT: Address = Address::repeat_byte(0x52);
+
 fn test_transaction_builder() -> TransactionBuilder {
     TransactionBuilder {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::from([0x51; 20]),
-        relay_adapt_contract: Address::from([0x52; 20]),
     }
 }
 
@@ -485,7 +486,6 @@ fn unproven_send_uses_proof_root_from_dirty_forest() {
         chain_type: 0,
         chain_id: 1,
         railgun_contract: Address::ZERO,
-        relay_adapt_contract: Address::ZERO,
     };
     let signer = MockSpendSigner {
         signed_msg: Cell::new(None),
@@ -812,7 +812,7 @@ async fn direct_composite_unshield_uses_transact_and_preserves_fee_output_role()
     ];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs: vec![
             CompositeUnshieldLeg {
                 token_address: token_a,
@@ -889,8 +889,11 @@ async fn relay_composite_binds_action_data_and_uses_exact_actions() {
             delegate: Address::from([0x43; 20]),
             execution_nonce: U256::from(9),
         });
-        let execution_account =
-            executor.map_or(builder.relay_adapt_contract, |context| context.executor);
+        let execution_account = executor.map_or(TEST_RELAY_ADAPT, |context| context.executor);
+        let adapter = Some(executor.map_or(
+            CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT),
+            CompositeAdapter::Executor,
+        ));
         let primary_token = Address::from([0x71; 20]);
         let wrapped_native = Address::from([0x72; 20]);
         let recipient = Address::from([0x73; 20]);
@@ -900,7 +903,7 @@ async fn relay_composite_binds_action_data_and_uses_exact_actions() {
         ];
         let forest = forest_for_utxos(&utxos);
         let request = CompositeUnshieldRequest {
-            executor,
+            adapter,
             legs: vec![
                 CompositeUnshieldLeg {
                     token_address: primary_token,
@@ -1055,8 +1058,11 @@ async fn mixed_send_and_public_unshield_bind_relay_and_preserve_output_roles() {
             delegate: Address::from([0x43; 20]),
             execution_nonce: U256::from(9),
         });
-        let execution_account =
-            executor.map_or(builder.relay_adapt_contract, |context| context.executor);
+        let execution_account = executor.map_or(TEST_RELAY_ADAPT, |context| context.executor);
+        let adapter = Some(executor.map_or(
+            CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT),
+            CompositeAdapter::Executor,
+        ));
         let send_token = Address::from([0xa1; 20]);
         let wrapped_native = Address::from([0xa2; 20]);
         let private_recipient = sample_address_data(0xa3).address_data();
@@ -1069,7 +1075,7 @@ async fn mixed_send_and_public_unshield_bind_relay_and_preserve_output_roles() {
         let prover = RecordingTransactionProver::default();
         let request = MixedPrivateActionRequest {
             executor_calls: Vec::new(),
-            executor,
+            adapter,
             private_sends: vec![MixedPrivateSend {
                 token_address: send_token,
                 amount: uint!(10_U256),
@@ -1197,7 +1203,7 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
         .into(),
     }];
     let request = MixedPrivateActionRequest {
-        executor: Some(context),
+        adapter: Some(CompositeAdapter::Executor(context)),
         executor_calls: calls.clone(),
         private_sends: vec![MixedPrivateSend {
             token_address: fee_token,
@@ -1286,16 +1292,16 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
     let signed = RelayAdapt7702::executeCall::abi_decode(&signed.data).unwrap();
     assert!(signed._actionData.calls.is_empty());
     let mut wrong_chain = setup.clone();
-    wrong_chain.executor = Some(ExecutorContext {
+    wrong_chain.adapter = Some(CompositeAdapter::Executor(ExecutorContext {
         chain_id: context.chain_id + 1,
         ..context
-    });
+    }));
     assert!(matches!(
         builder.preview_mixed_private_action_plan(&utxos, &wrong_chain),
         Err(BuildError::InvalidExecutorContext)
     ));
     let mut direct = setup;
-    direct.executor = None;
+    direct.adapter = None;
     let direct = builder
         .preview_mixed_private_action_plan(&utxos, &direct)
         .unwrap();
@@ -1306,7 +1312,7 @@ async fn executor_recovery_calls_bind_private_fee_proofs_and_exact_shield_action
     assert!(!direct.shape.uses_relay_adapt);
 
     let mut no_executor = request.clone();
-    no_executor.executor = None;
+    no_executor.adapter = None;
     assert!(matches!(
         builder.preview_mixed_private_action_plan(&utxos, &no_executor),
         Err(BuildError::InvalidExecutorContext)
@@ -1354,7 +1360,7 @@ async fn executor_fee_less_unshield_plan_sends_exact_amount_to_executor() {
         },
     ];
     let request = MixedPrivateActionRequest {
-        executor: Some(context),
+        adapter: Some(CompositeAdapter::Executor(context)),
         executor_calls: calls.clone(),
         private_sends: Vec::new(),
         public_unshields: vec![CompositeUnshieldLeg {
@@ -1444,7 +1450,7 @@ fn swap_pre_hook_request(
     amount: u64,
 ) -> MixedPrivateActionRequest {
     MixedPrivateActionRequest {
-        executor: Some(context),
+        adapter: Some(CompositeAdapter::Executor(context)),
         executor_calls: calls,
         private_sends: Vec::new(),
         public_unshields: vec![CompositeUnshieldLeg {
@@ -1821,7 +1827,7 @@ async fn mixed_plan_pinned_rebuild_rejects_input_and_shape_changes() {
     let forest = forest_for_utxos(&utxos);
     let request = MixedPrivateActionRequest {
         executor_calls: Vec::new(),
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         private_sends: vec![MixedPrivateSend {
             token_address: send_token,
             amount: uint!(10_U256),
@@ -1990,7 +1996,7 @@ async fn mixed_max_spend_reserves_exact_public_output() {
     let forest = forest_for_utxos(&utxos);
     let request = MixedPrivateActionRequest {
         executor_calls: Vec::new(),
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         private_sends: vec![MixedPrivateSend {
             token_address: token,
             amount: uint!(81_U256),
@@ -2073,7 +2079,7 @@ async fn mixed_max_spend_does_not_reduce_underfunded_public_output() {
     let forest = forest_for_utxos(&utxos);
     let request = MixedPrivateActionRequest {
         executor_calls: Vec::new(),
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         private_sends: vec![MixedPrivateSend {
             token_address: send_token,
             amount: uint!(10_U256),
@@ -2129,7 +2135,7 @@ async fn mixed_fragmented_ninth_transaction_reports_shape_limit() {
     let forest = forest_for_utxos(&utxos);
     let request = MixedPrivateActionRequest {
         executor_calls: Vec::new(),
-        executor: None,
+        adapter: None,
         private_sends: vec![MixedPrivateSend {
             token_address: send_token,
             amount: uint!(7_U256),
@@ -2183,7 +2189,7 @@ async fn relay_composite_with_later_fee_leg_keeps_fee_transaction_first() {
     ];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         legs: vec![
             CompositeUnshieldLeg {
                 token_address: primary_token,
@@ -2262,7 +2268,7 @@ async fn composite_unshield_rejects_empty_requests() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs: Vec::new(),
         relay_actions: None,
         broadcaster_fee: None,
@@ -2291,7 +2297,7 @@ async fn composite_unshield_rejects_relay_adapt_leg_without_actions() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         legs: vec![CompositeUnshieldLeg {
             token_address: Address::from([0x83; 20]),
             amount: uint!(1_U256),
@@ -2321,11 +2327,100 @@ async fn composite_unshield_rejects_relay_adapt_leg_without_actions() {
 }
 
 #[tokio::test]
+async fn composite_and_mixed_reject_mismatched_adapter_before_signing() {
+    let wallet = test_wallet();
+    let builder = test_transaction_builder();
+    let token = Address::from([0x84; 20]);
+    let recipient = Address::from([0x85; 20]);
+    let utxos = vec![wallet_test_utxo(&wallet, token, 10, 0, 0)];
+    let forest = forest_for_utxos(&utxos);
+    let signer = MockSpendSigner {
+        signed_msg: Cell::new(None),
+    };
+    let prover = RecordingTransactionProver::default();
+    let relay_leg = CompositeUnshieldLeg {
+        token_address: token,
+        amount: uint!(5_U256),
+        recipient: CompositeUnshieldRecipient::RelayAdapt,
+        role: CompositeUnshieldLegRole::NativeTopUp,
+    };
+    let direct_leg = CompositeUnshieldLeg {
+        recipient: CompositeUnshieldRecipient::Public(recipient),
+        role: CompositeUnshieldLegRole::Primary,
+        ..relay_leg
+    };
+    let relay_actions = CompositeRelayActions {
+        min_gas_limit: U256::ZERO,
+        calls: vec![CompositeRelayAction::Transfer {
+            token: CompositeRelayActionToken::Erc20(token),
+            recipient,
+            amount: uint!(5_U256),
+        }],
+    };
+    let relay_adapt = Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT));
+
+    for (leg, adapter) in [(relay_leg, None), (direct_leg, relay_adapt)] {
+        let uses_relay = leg.recipient.uses_relay_adapt();
+        let actions = uses_relay.then(|| relay_actions.clone());
+        let composite = CompositeUnshieldRequest {
+            adapter,
+            legs: vec![leg],
+            relay_actions: actions.clone(),
+            broadcaster_fee: None,
+            min_gas_price: 0,
+            verify_proof: false,
+            spend_up_to: false,
+        };
+        let mixed = MixedPrivateActionRequest {
+            adapter,
+            executor_calls: Vec::new(),
+            private_sends: Vec::new(),
+            public_unshields: vec![leg],
+            relay_actions: actions,
+            min_gas_price: 0,
+            verify_proof: false,
+            spend_up_to: false,
+            rebuild: None,
+        };
+        let composite_error = builder
+            .build_composite_unshield_plan_inner(
+                &wallet.viewing,
+                &signer,
+                &forest,
+                &utxos,
+                composite,
+                &prover,
+            )
+            .await
+            .expect_err("mismatched composite adapter");
+        let mixed_error = builder
+            .build_mixed_private_action_plan_inner(
+                &wallet.viewing,
+                &signer,
+                &forest,
+                &utxos,
+                mixed,
+                &prover,
+            )
+            .await
+            .expect_err("mismatched mixed adapter");
+        for error in [composite_error, mixed_error] {
+            assert!(matches!(
+                (uses_relay, error),
+                (true, BuildError::MissingCompositeAdapter) | (false, BuildError::UnusedRelayAdapt)
+            ));
+        }
+    }
+    assert!(signer.signed_msg.get().is_none());
+    assert!(prover.bound_params_hashes().is_empty());
+}
+
+#[tokio::test]
 async fn composite_unshield_rejects_relay_adapt_leg_with_empty_actions() {
     let wallet = test_wallet();
     let builder = test_transaction_builder();
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         legs: vec![CompositeUnshieldLeg {
             token_address: Address::from([0x84; 20]),
             amount: uint!(1_U256),
@@ -2365,7 +2460,7 @@ async fn composite_unshield_rejects_zero_amount_relay_actions() {
     let utxos = vec![wallet_test_utxo(&wallet, token, 1, 0, 0)];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: Some(CompositeAdapter::RelayAdapt(TEST_RELAY_ADAPT)),
         legs: vec![CompositeUnshieldLeg {
             token_address: token,
             amount: uint!(1_U256),
@@ -2414,7 +2509,7 @@ async fn composite_unshield_enforces_eight_transaction_batch_limit() {
         .collect::<Vec<_>>();
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs: (0_u8..9)
             .map(|index| CompositeUnshieldLeg {
                 token_address: Address::from([index + 1; 20]),
@@ -2496,7 +2591,7 @@ async fn composite_fee_placement_backtracks_after_current_leg_exceeds_remaining_
         role: CompositeUnshieldLegRole::Other,
     });
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs,
         relay_actions: None,
         broadcaster_fee: Some(BroadcasterFeeOutput {
@@ -2747,7 +2842,7 @@ async fn composite_fee_matching_later_leg_emits_fee_transaction_first() {
     ];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs: vec![
             CompositeUnshieldLeg {
                 token_address: token_a,
@@ -2815,7 +2910,7 @@ async fn composite_same_token_later_fee_emits_fee_transaction_first() {
     ];
     let forest = forest_for_utxos(&utxos);
     let request = CompositeUnshieldRequest {
-        executor: None,
+        adapter: None,
         legs: vec![
             CompositeUnshieldLeg {
                 token_address: token,
@@ -3390,7 +3485,7 @@ async fn equal_value_notes_select_without_exhaustive_search() {
     let token = Address::from([0xd1; 20]);
     let unshield = |amount| MixedPrivateActionRequest {
         executor_calls: Vec::new(),
-        executor: None,
+        adapter: None,
         private_sends: Vec::new(),
         public_unshields: vec![CompositeUnshieldLeg {
             token_address: token,

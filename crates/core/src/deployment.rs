@@ -32,7 +32,7 @@ const ARBITRUM_RELAY_ADAPT_HISTORY: &[Address] = &[
 pub struct RailgunDeployment {
     pub chain_id: u64,
     pub contract: Address,
-    pub relay_adapt_contract: Address,
+    pub relay_adapt_contract: Option<Address>,
     pub relay_adapt_7702_contract: Address,
     /// Every shared `RelayAdapt` contract the chain has used, the current one included.
     pub relay_adapt_history: &'static [Address],
@@ -48,7 +48,7 @@ impl RailgunDeployment {
             1 => Some(Self {
                 chain_id,
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
-                relay_adapt_contract: address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405"),
+                relay_adapt_contract: Some(address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405")),
                 relay_adapt_7702_contract: address!("0x05ae73c5925d843864ae6f261f3175de2ebcd963"),
                 relay_adapt_history: ETHEREUM_RELAY_ADAPT_HISTORY,
                 deployment_block: 14_737_691,
@@ -58,7 +58,7 @@ impl RailgunDeployment {
             56 => Some(Self {
                 chain_id,
                 contract: address!("0x590162bf4b50f6576a459b75309ee21d92178a10"),
-                relay_adapt_contract: address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd"),
+                relay_adapt_contract: Some(address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd")),
                 relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
                 relay_adapt_history: BNB_CHAIN_RELAY_ADAPT_HISTORY,
                 deployment_block: 17_633_701,
@@ -68,7 +68,7 @@ impl RailgunDeployment {
             137 => Some(Self {
                 chain_id,
                 contract: address!("0x19b620929f97b7b990801496c3b361ca5def8c71"),
-                relay_adapt_contract: address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd"),
+                relay_adapt_contract: Some(address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd")),
                 relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
                 relay_adapt_history: POLYGON_RELAY_ADAPT_HISTORY,
                 deployment_block: 28_083_766,
@@ -78,7 +78,7 @@ impl RailgunDeployment {
             42161 => Some(Self {
                 chain_id,
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
-                relay_adapt_contract: address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
+                relay_adapt_contract: Some(address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b")),
                 relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
                 relay_adapt_history: ARBITRUM_RELAY_ADAPT_HISTORY,
                 deployment_block: 56_109_834,
@@ -86,6 +86,22 @@ impl RailgunDeployment {
                 legacy_shield_block: 68_196_853,
             }),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn current_relay_adapt_is_latest_history_entry() {
+        for chain_id in [1, 56, 137, 42161] {
+            let deployment = RailgunDeployment::for_chain(chain_id).unwrap();
+            assert_eq!(
+                deployment.relay_adapt_contract,
+                deployment.relay_adapt_history.last().copied()
+            );
         }
     }
 }
