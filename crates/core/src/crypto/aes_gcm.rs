@@ -35,6 +35,15 @@ pub fn decrypt_in_place_16b_iv(
 pub fn encrypt_in_place_16b_iv(key: &[u8; 32], buffer: &mut [u8]) -> Result<[u8; 32], AesGcmError> {
     let mut iv = [0u8; 16];
     fill(&mut iv).map_err(|_| AesGcmError::RandomFailed)?;
+    encrypt_in_place_with_iv(key, iv, buffer)
+}
+
+/// Encrypt with a caller-supplied IV, which must never repeat under the same key.
+pub(crate) fn encrypt_in_place_with_iv(
+    key: &[u8; 32],
+    iv: [u8; 16],
+    buffer: &mut [u8],
+) -> Result<[u8; 32], AesGcmError> {
     let cipher = Aes256Gcm16::new_from_slice(key).map_err(|_| AesGcmError::InvalidKey)?;
     #[allow(deprecated)]
     let nonce = Nonce::from_slice(&iv);

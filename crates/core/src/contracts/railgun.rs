@@ -120,6 +120,7 @@ sol! {
     }
     function shield(ShieldRequest[] _shieldRequests);
 
+    function wrapBase(uint256 _amount);
     function unwrapBase(uint256 _amount);
     function transfer(TokenTransfer[] _transfers);
 

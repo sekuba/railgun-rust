@@ -4,10 +4,11 @@ use alloy::sol_types::SolCall;
 use crate::contracts::railgun::{
     CommitmentPreimage, ShieldCiphertext, ShieldRequest, TokenData, approveCall, shieldCall,
 };
-use crate::crypto::aes_gcm::{AesGcmError, encrypt_in_place_16b_iv};
+use crate::crypto::aes_gcm::{AesGcmError, encrypt_in_place_with_iv};
 use crate::crypto::shared_key::{SharedKeyError, shared_symmetric_key};
 use crate::notes::Note;
 
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use ed25519_dalek::SigningKey;
 use getrandom::fill;
 use thiserror::Error;
@@ -103,8 +104,46 @@ pub fn build_shield_request(
     shield_private_key: &[u8; 32],
 ) -> Result<ShieldRequest, ShieldError> {
     let mut random = [0u8; 16];
+    let mut gcm_iv = [0u8; 16];
+    let mut ctr_iv = [0u8; 16];
     fill(&mut random).map_err(|_| ShieldError::RandomFailed)?;
+    fill(&mut gcm_iv).map_err(|_| ShieldError::RandomFailed)?;
+    fill(&mut ctr_iv).map_err(|_| ShieldError::RandomFailed)?;
+    build_shield_request_with(
+        ShieldRandomness {
+            random,
+            gcm_iv,
+            ctr_iv,
+        },
+        master_public_key,
+        viewing_public_key,
+        token,
+        value,
+        shield_private_key,
+    )
+}
 
+/// Randomness drawn for one shield request; fixed only by reference fixtures.
+#[derive(Clone, Copy)]
+struct ShieldRandomness {
+    random: [u8; 16],
+    gcm_iv: [u8; 16],
+    ctr_iv: [u8; 16],
+}
+
+fn build_shield_request_with(
+    randomness: ShieldRandomness,
+    master_public_key: U256,
+    viewing_public_key: &[u8; 32],
+    token: TokenData,
+    value: Uint<120, 2>,
+    shield_private_key: &[u8; 32],
+) -> Result<ShieldRequest, ShieldError> {
+    let ShieldRandomness {
+        random,
+        gcm_iv,
+        ctr_iv,
+    } = randomness;
     let npk = Note::npk_for(master_public_key, random);
 
     let preimage = CommitmentPreimage {
@@ -113,7 +152,13 @@ pub fn build_shield_request(
         value,
     };
 
-    let ciphertext = encrypt_shield_random(random, shield_private_key, viewing_public_key)?;
+    let ciphertext = encrypt_shield_random(
+        random,
+        gcm_iv,
+        ctr_iv,
+        shield_private_key,
+        viewing_public_key,
+    )?;
 
     Ok(ShieldRequest {
         preimage,
@@ -156,6 +201,8 @@ pub fn derive_shield_private_key(evm_private_key: &[u8; 32]) -> Result<[u8; 32],
 
 fn encrypt_shield_random(
     random: [u8; 16],
+    gcm_iv: [u8; 16],
+    ctr_iv: [u8; 16],
     shield_private_key: &[u8; 32],
     viewing_public_key: &[u8; 32],
 ) -> Result<ShieldCiphertext, ShieldError> {
@@ -169,15 +216,24 @@ fn encrypt_shield_random(
 
     // Encrypt the 16-byte random
     let mut buffer = random;
-    let iv_tag = encrypt_in_place_16b_iv(&shared_key, &mut buffer)?;
+    let iv_tag = encrypt_in_place_with_iv(&shared_key, gcm_iv, &mut buffer)?;
 
-    // Pack into ShieldCiphertext: encryptedBundle[0] = iv||tag, encryptedBundle[1] = encrypted random (padded), encryptedBundle[2] = zeros
-    let mut bundle = [FixedBytes::<32>::ZERO; 3];
-    bundle[0] = FixedBytes::from(iv_tag);
-    let mut padded_ct = [0u8; 32];
-    padded_ct[..16].copy_from_slice(&buffer);
-    bundle[1] = FixedBytes::from(padded_ct);
-    // bundle[2] stays zero
+    // Encrypt the receiver viewing key to the shielder, as the Railgun SDK engine does:
+    // AES-256-CTR keyed directly by shield_private_key.
+    let mut encrypted_receiver = *viewing_public_key;
+    ctr::Ctr128BE::<aes::Aes256>::new(shield_private_key.into(), &ctr_iv.into())
+        .apply_keystream(&mut encrypted_receiver);
+
+    // Pack into ShieldCiphertext: encryptedBundle[0] = gcm iv||tag,
+    // encryptedBundle[1] = encrypted random||ctr iv, encryptedBundle[2] = encrypted receiver
+    let mut bundle1 = [0u8; 32];
+    bundle1[..16].copy_from_slice(&buffer);
+    bundle1[16..].copy_from_slice(&ctr_iv);
+    let bundle = [
+        FixedBytes::from(iv_tag),
+        FixedBytes::from(bundle1),
+        FixedBytes::from(encrypted_receiver),
+    ];
 
     Ok(ShieldCiphertext {
         encryptedBundle: bundle,
@@ -188,6 +244,84 @@ fn encrypt_shield_random(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    fn sdk_fixture() -> Value {
+        serde_json::from_str(include_str!("../../tests/fixtures/sdk-shield.json"))
+            .expect("SDK shield fixture")
+    }
+
+    fn fixture_bytes<const N: usize>(value: &Value) -> [u8; N] {
+        let hex = value.as_str().expect("hex string");
+        alloy::hex::decode(hex)
+            .expect("hex bytes")
+            .try_into()
+            .expect("fixed length")
+    }
+
+    #[test]
+    fn shield_request_matches_sdk() {
+        let fixture = sdk_fixture();
+        let inputs = &fixture["inputs"];
+        let shield_private_key =
+            derive_shield_private_key(&fixture_bytes(&inputs["shieldSignerKey"]))
+                .expect("shield key");
+        assert_eq!(
+            shield_private_key,
+            fixture_bytes::<32>(&fixture["shieldPrivateKey"])
+        );
+        let master_public_key: U256 = inputs["masterPublicKey"].as_str().unwrap().parse().unwrap();
+        let value: Uint<120, 2> = inputs["amount"].as_str().unwrap().parse().unwrap();
+        let token: Address = fixture["erc20"]["token"].as_str().unwrap().parse().unwrap();
+        let request = build_shield_request_with(
+            ShieldRandomness {
+                random: fixture_bytes(&inputs["random"]),
+                gcm_iv: fixture_bytes(&inputs["gcmIv"]),
+                ctr_iv: fixture_bytes(&inputs["ctrIv"]),
+            },
+            master_public_key,
+            &fixture_bytes(&fixture["viewingPublicKey"]),
+            TokenData::erc20(token),
+            value,
+            &shield_private_key,
+        )
+        .expect("shield request");
+        let expected: alloy::primitives::Bytes = fixture["erc20"]["shieldCalldata"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            alloy::primitives::Bytes::from(
+                shieldCall {
+                    _shieldRequests: vec![request.clone()],
+                }
+                .abi_encode()
+            ),
+            expected
+        );
+
+        // The receiver recovers the note random with its viewing key.
+        let [iv_tag, random_and_ctr_iv, encrypted_receiver] =
+            request.ciphertext.encryptedBundle.map(|word| word.0);
+        let shared_key = shared_symmetric_key(
+            &fixture_bytes(&inputs["viewingPrivateKey"]),
+            &request.ciphertext.shieldKey.0,
+        )
+        .expect("receiver shared key");
+        let (iv, tag) = crate::crypto::aes_gcm::split_iv_tag(iv_tag);
+        let mut random: [u8; 16] = random_and_ctr_iv[..16].try_into().unwrap();
+        crate::crypto::aes_gcm::decrypt_in_place_16b_iv(&shared_key, &iv, &tag, &mut random)
+            .expect("receiver decrypts random");
+        assert_eq!(random, fixture_bytes::<16>(&inputs["random"]));
+
+        // The shielder recovers the receiver viewing key with its shield key.
+        let mut receiver = encrypted_receiver;
+        let ctr_iv: [u8; 16] = random_and_ctr_iv[16..].try_into().unwrap();
+        ctr::Ctr128BE::<aes::Aes256>::new(&shield_private_key.into(), &ctr_iv.into())
+            .apply_keystream(&mut receiver);
+        assert_eq!(receiver, fixture_bytes::<32>(&fixture["viewingPublicKey"]));
+    }
 
     // Note value left by `RailgunLogic.getFee(amount, true, fee_bp)`.
     fn net(amount: U256, fee_bp: u64) -> U256 {

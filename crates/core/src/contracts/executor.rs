@@ -13,7 +13,7 @@ use super::across::{SpokePool, private_delivery_message};
 use super::cow::{GPv2Settlement, OrderUid};
 use super::railgun::{
     Call, RelayAdapt7702, RelayAdapt7702ActionData, ShieldRequest, TokenTransfer, Transaction,
-    approveCall, shieldCall, transferCall,
+    approveCall, shieldCall, transferCall, wrapBaseCall,
 };
 
 /// Storage layout of the nonce-bearing profile at contract revision
@@ -125,6 +125,10 @@ pub enum ExecutorActionError {
     NonErc20Shield,
     #[error("full-balance shield token does not match the guarded token")]
     ShieldTokenMismatch,
+    #[error(
+        "native shield value must be nonzero; wrapBase and shield need the exact attached amount"
+    )]
+    ZeroNativeShieldValue,
     #[error("bridge deposit depositor must be the executor")]
     DepositorNotExecutor,
     #[error("bridge deposit message must be empty")]
@@ -352,6 +356,48 @@ pub fn guarded_shield_calls(
         .call(executor)?,
         ExecutorAction::ShieldFullBalance(shield).call(executor)?,
     ])
+}
+
+/// Action data for a native shield executed by a delegated account, matching
+/// the SDK's `createShieldBaseTokenTransaction7702`: the executor wraps the
+/// attached base token and shields it under `request`, the wrapped-token
+/// ERC-20 request for the exact attached amount.
+///
+/// Sign it with [`execute_signing_hash`] and no private transactions, then
+/// encode [`RelayAdapt7702::executeCall`] with an empty transaction list.
+pub fn native_shield_action_data(
+    executor: Address,
+    request: ShieldRequest,
+) -> Result<RelayAdapt7702ActionData, ExecutorActionError> {
+    if request.preimage.token.tokenType != ERC20_TOKEN_TYPE {
+        return Err(ExecutorActionError::NonErc20Shield);
+    }
+    if request.preimage.value.is_zero() {
+        return Err(ExecutorActionError::ZeroNativeShieldValue);
+    }
+    let call = |data: Vec<u8>| Call {
+        to: executor,
+        data: data.into(),
+        value: U256::ZERO,
+    };
+    Ok(RelayAdapt7702ActionData {
+        requireSuccess: true,
+        minGasLimit: U256::ZERO,
+        calls: vec![
+            call(
+                wrapBaseCall {
+                    _amount: U256::from(request.preimage.value),
+                }
+                .abi_encode(),
+            ),
+            call(
+                shieldCall {
+                    _shieldRequests: vec![request],
+                }
+                .abi_encode(),
+            ),
+        ],
+    })
 }
 
 /// Post-hook calls that bridge `deposit.inputAmount` of `deposit.inputToken`
