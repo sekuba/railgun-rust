@@ -6,19 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 
-/// Infer executor capability from the advertised, accepted nonce-bearing delegate.
-///
-/// This advertisement is a compatibility heuristic, not proof of server behavior.
-/// Callers must separately check wire-protocol compatibility, fee-row signature,
-/// expiry, availability, chain profile, and required POIs.
-#[must_use]
-pub fn supports_nonce_bearing_executor(
-    advertised_delegate: Option<Address>,
-    accepted_delegate: Address,
-) -> bool {
-    advertised_delegate == Some(accepted_delegate)
-}
-
 #[derive(Debug, Error)]
 pub enum PayloadError {
     #[error("serialize payload")]
@@ -131,13 +118,7 @@ mod tests {
 
         let (body, verified) = payload.decode_and_verify().expect("decoded payload");
         assert!(verified);
-        assert!(supports_nonce_bearing_executor(
-            body.relay_adapt_7702,
-            delegate,
-        ));
-        for advertised in [None, Some(Address::repeat_byte(0x23))] {
-            assert!(!supports_nonce_bearing_executor(advertised, delegate));
-        }
+        assert_eq!(body.relay_adapt_7702, Some(delegate));
 
         payload.signature[0] ^= 1;
         let (_, verified) = payload

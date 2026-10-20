@@ -7,6 +7,7 @@
 use alloy::primitives::{Address, B256, Bytes, Signature, U256, keccak256};
 use alloy::sol;
 use alloy::sol_types::{Eip712Domain, SolCall, SolStruct, SolValue, eip712_domain};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::across::{SpokePool, private_delivery_message};
@@ -36,6 +37,22 @@ use super::railgun::{
 /// - Ordinary value transfers to or from the delegated account do not touch
 ///   the storage nonce.
 pub const EXECUTION_NONCE_STORAGE_SLOT: U256 = U256::ZERO;
+
+/// The ABI and signature scheme a `RelayAdapt7702` delegate implements.
+///
+/// Persisted by wallets, so variant names are a compatibility format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutorCapability {
+    /// The four-argument `execute` and signed `multicall` ABI described in this module.
+    NonceBearingV1,
+}
+
+/// A `RelayAdapt7702` deployment an executor account can delegate to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecutorDelegate {
+    pub address: Address,
+    pub capability: ExecutorCapability,
+}
 
 sol! {
     struct Execute { bytes32 payloadHash; }

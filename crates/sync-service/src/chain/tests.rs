@@ -730,6 +730,7 @@ async fn concurrent_register_wallet_returns_single_actor_handle() {
             legacy_shield_block: 0,
             relay_adapt_contract: None,
             relay_adapt_7702_contract: Address::ZERO,
+            relay_adapt_7702_delegates: &[],
             relay_adapt_history: &[],
         },
         sync: crate::RailgunSyncOptions {
@@ -5588,6 +5589,7 @@ async fn indexed_wallet_catch_up_hands_artifact_exhaustion_to_squid_tail() {
             legacy_shield_block: 0,
             relay_adapt_contract: None,
             relay_adapt_7702_contract: Address::ZERO,
+            relay_adapt_7702_delegates: &[],
             relay_adapt_history: &[],
         },
         sync: crate::RailgunSyncOptions {
@@ -5780,6 +5782,7 @@ async fn indexed_wallet_artifact_prepare_scope_rejects_epoch_invalidated_before_
             legacy_shield_block: 0,
             relay_adapt_contract: None,
             relay_adapt_7702_contract: Address::ZERO,
+            relay_adapt_7702_delegates: &[],
             relay_adapt_history: &[],
         },
         sync: crate::RailgunSyncOptions {
@@ -8412,6 +8415,7 @@ fn test_chain_config(
             legacy_shield_block: 0,
             relay_adapt_contract: None,
             relay_adapt_7702_contract: Address::ZERO,
+            relay_adapt_7702_delegates: &[],
             relay_adapt_history: &[],
         },
         sync: crate::RailgunSyncOptions {

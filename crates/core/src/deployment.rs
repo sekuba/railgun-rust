@@ -2,6 +2,8 @@
 
 use alloy::primitives::{Address, address};
 
+use crate::contracts::executor::{ExecutorCapability, ExecutorDelegate};
+
 const ETHEREUM_RELAY_ADAPT_HISTORY: &[Address] = &[
     address!("0x22af4EDBeA3De885dDa8f0a0653E6209e44e5B84"),
     address!("0xc3f2C8F9d5F0705De706b1302B7a039e1e11aC88"),
@@ -28,12 +30,33 @@ const ARBITRUM_RELAY_ADAPT_HISTORY: &[Address] = &[
     address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b"),
 ];
 
+const fn nonce_bearing_v1(address: Address) -> ExecutorDelegate {
+    ExecutorDelegate {
+        address,
+        capability: ExecutorCapability::NonceBearingV1,
+    }
+}
+
+const ETHEREUM_RELAY_ADAPT_7702_DELEGATES: &[ExecutorDelegate] = &[
+    nonce_bearing_v1(address!("0x05aE73C5925d843864AE6f261f3175dE2ebCd963")),
+    nonce_bearing_v1(address!("0x1F74b4339990Db761bC0168F20D294A3a141497e")),
+];
+
+/// Shared by BNB Chain, Polygon and Arbitrum.
+const RELAY_ADAPT_7702_DELEGATES: &[ExecutorDelegate] = &[
+    nonce_bearing_v1(address!("0x48cf4b897f64D81212c1423D78a05E828d0cE19d")),
+    nonce_bearing_v1(address!("0xa2BFd382c54bb33DF6A13f21acd8770dc1e67D4D")),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RailgunDeployment {
     pub chain_id: u64,
     pub contract: Address,
     pub relay_adapt_contract: Option<Address>,
+    /// The primary `RelayAdapt7702` delegate, for new delegations without another choice.
     pub relay_adapt_7702_contract: Address,
+    /// Every `RelayAdapt7702` delegate the chain has used, oldest first, the primary last.
+    pub relay_adapt_7702_delegates: &'static [ExecutorDelegate],
     /// Every shared `RelayAdapt` contract the chain has used, the current one included.
     pub relay_adapt_history: &'static [Address],
     pub deployment_block: u64,
@@ -49,7 +72,8 @@ impl RailgunDeployment {
                 chain_id,
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
                 relay_adapt_contract: Some(address!("0xAc9f360Ae85469B27aEDdEaFC579Ef2d052aD405")),
-                relay_adapt_7702_contract: address!("0x05ae73c5925d843864ae6f261f3175de2ebcd963"),
+                relay_adapt_7702_contract: address!("0x1F74b4339990Db761bC0168F20D294A3a141497e"),
+                relay_adapt_7702_delegates: ETHEREUM_RELAY_ADAPT_7702_DELEGATES,
                 relay_adapt_history: ETHEREUM_RELAY_ADAPT_HISTORY,
                 deployment_block: 14_737_691,
                 v2_start_block: 16_076_750,
@@ -59,7 +83,8 @@ impl RailgunDeployment {
                 chain_id,
                 contract: address!("0x590162bf4b50f6576a459b75309ee21d92178a10"),
                 relay_adapt_contract: Some(address!("0xf82d00fc51f730f42a00f85e74895a2849fff2dd")),
-                relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
+                relay_adapt_7702_contract: address!("0xa2BFd382c54bb33DF6A13f21acd8770dc1e67D4D"),
+                relay_adapt_7702_delegates: RELAY_ADAPT_7702_DELEGATES,
                 relay_adapt_history: BNB_CHAIN_RELAY_ADAPT_HISTORY,
                 deployment_block: 17_633_701,
                 v2_start_block: 23_478_204,
@@ -69,7 +94,8 @@ impl RailgunDeployment {
                 chain_id,
                 contract: address!("0x19b620929f97b7b990801496c3b361ca5def8c71"),
                 relay_adapt_contract: Some(address!("0xF82d00fC51F730F42A00F85E74895a2849ffF2Dd")),
-                relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
+                relay_adapt_7702_contract: address!("0xa2BFd382c54bb33DF6A13f21acd8770dc1e67D4D"),
+                relay_adapt_7702_delegates: RELAY_ADAPT_7702_DELEGATES,
                 relay_adapt_history: POLYGON_RELAY_ADAPT_HISTORY,
                 deployment_block: 28_083_766,
                 v2_start_block: 36_219_104,
@@ -79,7 +105,8 @@ impl RailgunDeployment {
                 chain_id,
                 contract: address!("0xfa7093cdd9ee6932b4eb2c9e1cde7ce00b1fa4b9"),
                 relay_adapt_contract: Some(address!("0xB4F2d77bD12c6b548Ae398244d7FAD4ABCE4D89b")),
-                relay_adapt_7702_contract: address!("0x48cf4b897f64d81212c1423d78a05e828d0ce19d"),
+                relay_adapt_7702_contract: address!("0xa2BFd382c54bb33DF6A13f21acd8770dc1e67D4D"),
+                relay_adapt_7702_delegates: RELAY_ADAPT_7702_DELEGATES,
                 relay_adapt_history: ARBITRUM_RELAY_ADAPT_HISTORY,
                 deployment_block: 56_109_834,
                 v2_start_block: 0,
@@ -101,6 +128,20 @@ mod tests {
             assert_eq!(
                 deployment.relay_adapt_contract,
                 deployment.relay_adapt_history.last().copied()
+            );
+        }
+    }
+
+    #[test]
+    fn primary_relay_adapt_7702_is_latest_delegate() {
+        for chain_id in [1, 56, 137, 42161] {
+            let deployment = RailgunDeployment::for_chain(chain_id).unwrap();
+            assert_eq!(
+                Some(deployment.relay_adapt_7702_contract),
+                deployment
+                    .relay_adapt_7702_delegates
+                    .last()
+                    .map(|delegate| delegate.address)
             );
         }
     }
